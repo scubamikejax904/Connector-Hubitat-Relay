@@ -1,0 +1,29 @@
+{
+  "name": "motionblinds-hubitat-relay",
+  "version": "1.0.0",
+  "description": "UDP/HTTP bridge for controlling smart blinds",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "blinds",
+    "smart-home",
+    "udp",
+    "bridge"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "body-parser": "^1.20.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
