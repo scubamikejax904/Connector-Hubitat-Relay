@@ -1,5 +1,5 @@
 metadata {
-    definition(name: "Motionblinds Roller Child", namespace: "Motionblinds", author: "ScubaMikeJax904") {
+    definition(name: "Connector Bridge Roller Child", namespace: "Connector", author: "ScubaMikeJax904") {
         capability "WindowShade"
         capability "Switch"
         capability "SwitchLevel"
