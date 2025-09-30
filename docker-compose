@@ -2,15 +2,15 @@ version: "3.9"
 services:
   connectorrelay:
     container_name: connector-hubitat-relay
-    image: scubamikejax904/connectorhubitatrelay:latest
+    image: scubamikejax904/connectorrelay:latest
     restart: unless-stopped
     ports:
-      - "3069:3069" #can change port if necessary
+      - "3069:3069"
       - "32100:32100/UDP"
       - "32101:32101/UDP"
     network_mode: host
 # Environment variables for bridge connection
     environment:
       # Replace these values with your actual configuration
-      BRIDGE_IP: "XXX.XXX.XXX.XXX"
-      CONNECTOR_KEY: "yourappkeyhere"
+      BRIDGE_IP: "192.168.1.69"
+      CONNECTOR_KEY: "79851734-00bc-44"
