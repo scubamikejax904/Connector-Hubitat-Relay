@@ -1,0 +1,16 @@
+version: "3.9"
+services:
+  motionblinds:
+    container_name: motionblinds-hubitat-relay
+    image: scubamikejax904/motionblinds:latest
+    restart: unless-stopped
+    ports:
+      - "3069:3069"
+      - "32100:32100/UDP"
+      - "32101:32101/UDP"
+    network_mode: host
+# Environment variables for bridge connection
+    environment:
+      # Replace these values with your actual configuration
+      BRIDGE_IP: "XXX.XXX.XXX.XXX"
+      CONNECTOR_KEY: "yourappkeyhere"
