@@ -1,0 +1,200 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonBuilder
+
+metadata {
+    definition(name: "Motionblinds Bridge (HTTP)", namespace: "Motionblinds", author: "You") {
+        capability "Refresh"
+        command "refreshDevices"
+        command "pingBridge"
+        attribute "bridgeStatus", "string"
+        attribute "lastDiscovery", "string"
+    }
+}
+
+preferences {
+    input name: "serverIP", type: "string", title: "Node.js Server IP", required: true
+    input name: "serverPort", type: "number", title: "Node.js Server Port", defaultValue: 3069, required: true
+    input name: "pollInterval", type: "number", title: "Polling interval (minutes)", defaultValue: 5, required: true
+    input name: "pingInterval", type: "number", title: "Bridge health check interval (minutes)", defaultValue: 1, required: true
+    input name: "logEnable", type: "bool", title: "Enable Debug Logging?", defaultValue: true
+}
+
+// ------------------- Initialization -------------------
+def installed() {
+    refreshDevices()
+    schedulePolling()
+    schedulePing()
+}
+
+def updated() {
+    unschedule()
+    refreshDevices()
+    schedulePolling()
+    schedulePing()
+}
+
+def refresh() {
+    refreshDevices()
+}
+
+// ------------------- Bridge Ping / Health -------------------
+def pingBridge() {
+    if (!serverIP || !serverPort) return
+    if (logEnable) log.debug "Pinging Node.js bridge..."
+    def url = "http://${serverIP}:${serverPort}/devices"  // use /devices for health check
+    try {
+        httpGet(url) { resp ->
+            if(resp.status == 200) {
+                if (logEnable) log.debug "Bridge ping OK"
+                sendEvent(name: "bridgeStatus", value: "ok")
+                getChildDevices().each { it.sendEvent(name: "online", value: "online") }
+            } else {
+                log.warn "Bridge ping returned HTTP ${resp.status}"
+                sendEvent(name: "bridgeStatus", value: "offline")
+                getChildDevices().each { it.markOffline() }
+            }
+        }
+    } catch(Exception e) {
+        log.error "Bridge ping error: ${e.message}"
+        sendEvent(name: "bridgeStatus", value: "offline")
+        getChildDevices().each { it.markOffline() }
+    }
+}
+
+def schedulePing() {
+    def minutes = pingInterval ?: 1
+    if (logEnable) log.debug "Scheduling bridge ping every ${minutes} minute(s)"
+    unschedule("pingBridge")
+    switch(minutes) {
+        case 1: runEvery1Minute("pingBridge"); break
+        case 5: runEvery5Minutes("pingBridge"); break
+        case 10: runEvery10Minutes("pingBridge"); break
+        case 15: runEvery15Minutes("pingBridge"); break
+        case 30: runEvery30Minutes("pingBridge"); break
+        case 60: runEvery1Hour("pingBridge"); break
+        default:
+            log.warn "Unsupported pingInterval=${minutes}, defaulting to 5 minutes"
+            runEvery5Minutes("pingBridge")
+    }
+}
+
+// ------------------- Device Discovery -------------------
+def refreshDevices() {
+    if (logEnable) log.debug "Refreshing devices from Node.js server (httpGet)"
+    if (!serverIP || !serverPort) {
+        log.error "Server IP or Port not set"
+        return
+    }
+
+    def url = "http://${serverIP}:${serverPort}/devices"
+    try {
+        httpGet(url) { resp ->
+            if(resp.status == 200 && resp.data?.data) {
+                // Flatten in case server returns nested arrays
+                def deviceList = resp.data.data.flatten()
+                
+                deviceList.each { deviceInfo ->
+                    // Handle both Map objects (with mac) and strings
+                    def mac = (deviceInfo instanceof Map) ? deviceInfo.mac : deviceInfo
+                    if(!mac) return
+
+                    def child = getChildDevice(mac)
+                    if(!child) {
+                        if(logEnable) log.debug "Creating child device ${mac}"
+                        addChildDevice(
+                            "Motionblinds",
+                            "Motionblinds Roller Child",
+                            mac,
+                            [label: (deviceInfo instanceof Map ? deviceInfo.friendlyName : "Blind ${mac}"), isComponent: false]
+                        )
+                    }
+
+                    requestStatus(mac)
+                }
+
+                sendEvent(
+                    name: "lastDiscovery",
+                    value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+                )
+            } else {
+                log.warn "No devices found in server response"
+                sendEvent(name: "bridgeStatus", value: "offline")
+            }
+        }
+    } catch(Exception e) {
+        log.error "Cannot refresh devices: ${e.message}"
+        sendEvent(name: "bridgeStatus", value: "offline")
+    }
+}
+
+// ------------------- Status Request -------------------
+def requestStatus(mac) {
+    def url = "http://${serverIP}:${serverPort}/status/${mac}"
+    if(logEnable) log.debug "Requesting status for ${mac}"
+    try {
+        httpGet(url) { resp ->
+            if(resp.status == 200 && resp.data) {
+                updateChildState(mac, resp.data)
+            } else {
+                log.warn "Failed to get status for ${mac}: HTTP ${resp.status}"
+            }
+        }
+    } catch(Exception e) {
+        log.error "Status request error for ${mac}: ${e.message}"
+    }
+}
+
+// ------------------- Child State Update -------------------
+def updateChildState(mac, data) {
+    def child = getChildDevice(mac)
+    if(child) {
+        child.updateStateFromParent(data)
+        if(logEnable) {
+            def pos = data.currentPosition != null ? "${data.currentPosition}%" : "?"
+            def batt = data.batteryLevel != null ? "${data.batteryLevel}%" : "?"
+            def rssi = data.raw?.RSSI != null ? "${data.raw.RSSI} dBm" : "?"
+            def shadeState = child.currentValue("windowShade") ?: "?"
+            log.debug "Updated ${child.displayName} → pos=${pos}, shade=${shadeState}, battery=${batt}, rssi=${rssi}"
+        }
+    }
+}
+
+// ------------------- Move Commands -------------------
+def sendMoveCommand(mac, Map body) {
+    def url = "http://${serverIP}:${serverPort}/move/${mac}"
+    def jsonBody = new JsonBuilder(body).toString()
+    if(logEnable) log.debug "Sending POST to ${url} → ${jsonBody}"
+    
+    try {
+        httpPost(uri: url, body: jsonBody, requestContentType: "application/json") { resp ->
+            if(logEnable) log.debug "Move response for ${mac}: HTTP ${resp.status} → ${resp.data}"
+        }
+    } catch(Exception e) {
+        log.error "Move command error for ${mac}: ${e.message}"
+    }
+}
+
+// ------------------- Polling -------------------
+def schedulePolling() {
+    def minutes = pollInterval ?: 5
+    if(logEnable) log.debug "Scheduling polling every ${minutes} minute(s)"
+    unschedule("pollChildren")
+    switch(minutes) {
+        case 1: runEvery1Minute("pollChildren"); break
+        case 5: runEvery5Minutes("pollChildren"); break
+        case 10: runEvery10Minutes("pollChildren"); break
+        case 15: runEvery15Minutes("pollChildren"); break
+        case 30: runEvery30Minutes("pollChildren"); break
+        case 60: runEvery1Hour("pollChildren"); break
+        default:
+            log.warn "Unsupported pollInterval=${minutes}, defaulting to 5 minutes"
+            runEvery5Minutes("pollChildren")
+    }
+}
+
+def pollChildren() {
+    if(logEnable) log.debug "Polling all children..."
+    getChildDevices().each { child ->
+        requestStatus(child.deviceNetworkId)
+    }
+}
