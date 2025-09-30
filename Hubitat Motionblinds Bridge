@@ -2,7 +2,7 @@ import groovy.json.JsonSlurper
 import groovy.json.JsonBuilder
 
 metadata {
-    definition(name: "Motionblinds Bridge (HTTP)", namespace: "Motionblinds", author: "You") {
+    definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904") {
         capability "Refresh"
         command "refreshDevices"
         command "pingBridge"
