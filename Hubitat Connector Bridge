@@ -102,8 +102,8 @@ def refreshDevices() {
                     if(!child) {
                         if(logEnable) log.debug "Creating child device ${mac}"
                         addChildDevice(
-                            "Motionblinds",
-                            "Motionblinds Roller Child",
+                            "Connector",
+                            "Connector Bridge Roller Child",
                             mac,
                             [label: (deviceInfo instanceof Map ? deviceInfo.friendlyName : "Blind ${mac}"), isComponent: false]
                         )
