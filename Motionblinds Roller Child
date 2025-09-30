@@ -1,0 +1,100 @@
+metadata {
+    definition(name: "Motionblinds Roller Child", namespace: "Motionblinds", author: "ScubaMikeJax904") {
+        capability "WindowShade"
+        capability "Switch"
+        capability "SwitchLevel"
+        capability "Battery"
+        capability "Refresh"
+
+        command "stop"
+
+        attribute "rssi", "number"
+        attribute "online", "string"
+        attribute "lastUpdate", "string"
+    }
+}
+
+// Alias for Hubitat setPosition
+def setPosition(pos) {
+    setLevel(pos as int)
+}
+
+def open() {
+    parent.sendMoveCommand(device.deviceNetworkId, [operation: 1])
+    sendEvent(name: "windowShade", value: "opening")
+    sendEvent(name: "switch", value: "on")
+    sendEvent(name: "level", value: 0)
+}
+
+def close() {
+    parent.sendMoveCommand(device.deviceNetworkId, [operation: 0])
+    sendEvent(name: "windowShade", value: "closing")
+    sendEvent(name: "switch", value: "off")
+    sendEvent(name: "level", value: 100)
+}
+
+def stop() {
+    parent.sendMoveCommand(device.deviceNetworkId, [operation: 2])
+    sendEvent(name: "windowShade", value: "partially open")
+}
+
+def setLevel(level) {
+    level = Math.max(Math.min(level as int, 100), 0)
+    parent.sendMoveCommand(device.deviceNetworkId, [targetPosition: level])
+    sendEvent(name: "level", value: level)
+
+    if (level == 0) {
+        sendEvent(name: "windowShade", value: "open")
+        sendEvent(name: "switch", value: "on")
+    } else if (level == 100) {
+        sendEvent(name: "windowShade", value: "closed")
+        sendEvent(name: "switch", value: "off")
+    } else {
+        sendEvent(name: "windowShade", value: "partially open")
+        sendEvent(name: "switch", value: "on")
+    }
+}
+
+def refresh() {
+    parent.requestStatus(device.deviceNetworkId)
+}
+
+// ------------------- Update State from Parent -------------------
+def updateStateFromParent(data) {
+    if(!data) return
+
+    if(data.currentPosition != null) {
+        def pos = data.currentPosition as int
+        sendEvent(name: "level", value: pos)
+
+        if(pos == 0) {
+            sendEvent(name: "windowShade", value: "open")
+            sendEvent(name: "switch", value: "on")
+        } else if(pos == 100) {
+            sendEvent(name: "windowShade", value: "closed")
+            sendEvent(name: "switch", value: "off")
+        } else {
+            sendEvent(name: "windowShade", value: "partially open")
+            sendEvent(name: "switch", value: "on")
+        }
+    }
+
+    if(data.batteryLevel != null) sendEvent(name: "battery", value: data.batteryLevel as int)
+    if(data.raw?.RSSI != null) sendEvent(name: "rssi", value: data.raw.RSSI as int)
+
+    // Map Motionblinds currentState
+    if(data.raw?.currentState != null) {
+        switch(data.raw.currentState as int) {
+            case 1: sendEvent(name: "windowShade", value: "opening"); break
+            case 2: sendEvent(name: "windowShade", value: "closing"); break
+            case 3: /* idle, leave level as-is */ break
+        }
+    }
+
+    sendEvent(name: "lastUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
+    sendEvent(name: "online", value: "online")
+}
+
+def markOffline() {
+    sendEvent(name: "online", value: "offline")
+}
