@@ -1,8 +1,8 @@
 version: "3.9"
 services:
-  motionblinds:
-    container_name: motionblinds-hubitat-relay
-    image: scubamikejax904/motionblinds:latest
+  connectorrelay:
+    container_name: connector-hubitat-relay
+    image: scubamikejax904/connectorhubitatrelay:latest
     restart: unless-stopped
     ports:
       - "3069:3069" #can change port if necessary
