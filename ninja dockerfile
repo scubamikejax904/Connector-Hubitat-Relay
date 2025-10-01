@@ -1,0 +1,25 @@
+# Use official Node.js LTS image
+FROM node:18-slim
+
+# Set working directory
+WORKDIR /app
+
+# Copy package.json and package-lock.json first for caching
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install --production
+
+# Copy the rest of the application
+COPY . .
+
+# Expose HTTP port
+EXPOSE 3069
+
+# Environment variables (optional defaults)
+ENV BRIDGE_IP=127.0.0.1
+ENV CONNECTOR_KEY=your_key_here
+ENV PORT=3069
+
+# Start the application
+CMD ["node", "index.js"]
