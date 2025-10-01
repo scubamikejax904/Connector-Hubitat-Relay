@@ -1,5 +1,5 @@
 //Connector Bridge Hubitat Relay by ScubaMikeJax904
-//Ver. 2.0
+//Ver. 3.1
 
 
 // ----- Configuration -----
@@ -25,27 +25,57 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit');
 
-// ----- Logging Setup -----
-const winston = require('winston');
-const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.errors({ stack: true }),
-        winston.format.json()
-    ),
-    transports: [
-        new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                winston.format.simple()
-            )
-        }),
-        new winston.transports.File({ filename: 'app.log' })
-    ]
-});
+// ----- Simple Logging -----
+const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
+const currentLogLevel = LOG_LEVELS[process.env.LOG_LEVEL] || LOG_LEVELS.info;
+
+const logger = {
+    error: (...args) => currentLogLevel >= LOG_LEVELS.error && console.error(new Date().toISOString(), '[ERROR]', ...args),
+    warn: (...args) => currentLogLevel >= LOG_LEVELS.warn && console.warn(new Date().toISOString(), '[WARN]', ...args),
+    info: (...args) => currentLogLevel >= LOG_LEVELS.info && console.log(new Date().toISOString(), '[INFO]', ...args),
+    debug: (...args) => currentLogLevel >= LOG_LEVELS.debug && console.log(new Date().toISOString(), '[DEBUG]', ...args)
+};
+
+// ----- Simple Rate Limiting -----
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW = 15 * 60 * 1000; // 15 minutes
+const RATE_LIMIT_MAX = 100; // max requests per window
+
+function simpleRateLimit(req, res, next) {
+    const ip = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    
+    if (!rateLimitMap.has(ip)) {
+        rateLimitMap.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+        return next();
+    }
+    
+    const limit = rateLimitMap.get(ip);
+    
+    if (now > limit.resetTime) {
+        limit.count = 1;
+        limit.resetTime = now + RATE_LIMIT_WINDOW;
+        return next();
+    }
+    
+    if (limit.count >= RATE_LIMIT_MAX) {
+        return res.status(429).json({ error: 'Too many requests from this IP' });
+    }
+    
+    limit.count++;
+    next();
+}
+
+// Clean up rate limit map periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, limit] of rateLimitMap.entries()) {
+        if (now > limit.resetTime) {
+            rateLimitMap.delete(ip);
+        }
+    }
+}, RATE_LIMIT_WINDOW);
 
 // ----- State -----
 const devices = {}; // mac => { data, lastSeen, lastCommand }
@@ -58,7 +88,21 @@ const MOTOR_DEVICE_TYPE = '10000000';
 
 // ----- Helper Functions -----
 function isValidMAC(mac) {
-    return /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/i.test(mac);
+    // Standard MAC format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX
+    const standardMAC = /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/i.test(mac);
+    
+    // Extended format: 16 hex characters (like your system uses)
+    const extendedMAC = /^[0-9A-Fa-f]{16}$/i.test(mac);
+    
+    return standardMAC || extendedMAC;
+}
+
+function normalizeMAC(mac) {
+    // Convert 16-char hex to standard MAC format for logging
+    if (/^[0-9A-Fa-f]{16}$/i.test(mac)) {
+        return mac.match(/.{2}/g).join(':').toLowerCase();
+    }
+    return mac.toLowerCase();
 }
 
 function calculateAccessToken(tokenStr, key) {
@@ -118,7 +162,7 @@ function createUDPSocket() {
             // Handle device responses
             if (['Report', 'WriteDeviceAck', 'ReadDeviceAck'].includes(data.msgType)) {
                 updateDeviceState(data.mac, data.data);
-                logger.info(`${data.msgType} for ${data.mac}:`, data.data);
+                logger.info(`${data.msgType} for ${normalizeMAC(data.mac)}:`, data.data);
                 
                 // Resolve pending command if exists
                 if (data.msgID && pendingCommands.has(data.msgID)) {
@@ -257,28 +301,80 @@ function cleanupStaleDevices() {
 // ----- HTTP Setup -----
 const app = express();
 
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // limit each IP to 100 requests per windowMs
-    message: 'Too many requests from this IP'
-});
-
-app.use(limiter);
+app.use(simpleRateLimit);
 app.use(bodyParser.json());
 
 // Request logging middleware
 app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.path}`, { ip: req.ip, userAgent: req.get('User-Agent') });
+    logger.info(`${req.method} ${req.path}`, { ip: req.ip });
+    next();
+});
+
+// Debug logging middleware for MAC-based endpoints
+app.use('/status/:mac', (req, res, next) => {
+    logger.debug('Status request received:', {
+        mac: req.params.mac,
+        normalizedMAC: normalizeMAC(req.params.mac),
+        length: req.params.mac.length,
+        isHex: /^[0-9A-Fa-f]+$/i.test(req.params.mac)
+    });
+    next();
+});
+
+app.use('/open/:mac', (req, res, next) => {
+    logger.debug('Open request received:', {
+        mac: req.params.mac,
+        normalizedMAC: normalizeMAC(req.params.mac),
+        length: req.params.mac.length,
+        isHex: /^[0-9A-Fa-f]+$/i.test(req.params.mac)
+    });
+    next();
+});
+
+app.use('/close/:mac', (req, res, next) => {
+    logger.debug('Close request received:', {
+        mac: req.params.mac,
+        normalizedMAC: normalizeMAC(req.params.mac),
+        length: req.params.mac.length,
+        isHex: /^[0-9A-Fa-f]+$/i.test(req.params.mac)
+    });
+    next();
+});
+
+app.use('/stop/:mac', (req, res, next) => {
+    logger.debug('Stop request received:', {
+        mac: req.params.mac,
+        normalizedMAC: normalizeMAC(req.params.mac),
+        length: req.params.mac.length,
+        isHex: /^[0-9A-Fa-f]+$/i.test(req.params.mac)
+    });
+    next();
+});
+
+app.use('/target/:mac/:pos', (req, res, next) => {
+    logger.debug('Target request received:', {
+        mac: req.params.mac,
+        normalizedMAC: normalizeMAC(req.params.mac),
+        position: req.params.pos,
+        length: req.params.mac.length,
+        isHex: /^[0-9A-Fa-f]+$/i.test(req.params.mac)
+    });
     next();
 });
 
 // MAC address validation middleware
 app.param('mac', (req, res, next, mac) => {
     if (!isValidMAC(mac)) {
+        logger.warn('Invalid MAC address received:', {
+            mac,
+            length: mac.length,
+            isHex: /^[0-9A-Fa-f]+$/i.test(mac)
+        });
         return res.status(400).json({ 
             error: 'Invalid MAC address format',
-            expected: 'XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX'
+            expected: 'XX:XX:XX:XX:XX:XX, XX-XX-XX-XX-XX-XX, or 16 hex characters',
+            received: mac,
+            receivedLength: mac.length
         });
     }
     next();
@@ -326,8 +422,17 @@ app.get('/ping', (req, res) => {
 
 // List all devices
 app.get('/devices', (req, res) => {
+    // Create a normalized view of devices for response
+    const normalizedDevices = {};
+    Object.keys(devices).forEach(mac => {
+        normalizedDevices[mac] = {
+            ...devices[mac],
+            normalizedMAC: normalizeMAC(mac)
+        };
+    });
+    
     res.json({
-        devices,
+        devices: normalizedDevices,
         count: Object.keys(devices).length,
         timestamp: new Date().toISOString()
     });
@@ -338,8 +443,8 @@ app.post('/devices/refresh', async (req, res) => {
     try {
         const refreshPromises = Object.keys(devices).map(mac => 
             sendCommand(mac, { operation: 5 }).catch(err => {
-                logger.warn(`Failed to refresh device ${mac}:`, err.message);
-                return { mac, error: err.message };
+                logger.warn(`Failed to refresh device ${normalizeMAC(mac)}:`, err.message);
+                return { mac, normalizedMAC: normalizeMAC(mac), error: err.message };
             })
         );
         
@@ -368,23 +473,26 @@ app.get('/status/:mac', async (req, res) => {
         if (!deviceData) {
             return res.status(404).json({ 
                 error: 'Device not found or not responding',
-                mac 
+                mac,
+                normalizedMAC: normalizeMAC(mac)
             });
         }
         
         res.json({
             mac,
+            normalizedMAC: normalizeMAC(mac),
             data: deviceData.data,
             lastSeen: deviceData.lastSeen,
             lastCommand: deviceData.lastCommand,
             timestamp: new Date().toISOString()
         });
     } catch (err) {
-        logger.error(`Error getting status for ${mac}:`, err);
+        logger.error(`Error getting status for ${normalizeMAC(mac)}:`, err);
         res.status(500).json({ 
             error: 'Failed to get device status',
             message: err.message,
-            mac 
+            mac,
+            normalizedMAC: normalizeMAC(mac)
         });
     }
 });
@@ -394,13 +502,18 @@ app.get('/open/:mac', async (req, res) => {
     try {
         await sendCommand(req.params.mac, { operation: 1 });
         res.json({ 
-            mac: req.params.mac, 
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac),
             command: 'open',
             timestamp: new Date().toISOString()
         });
     } catch (err) {
-        logger.error(`Error opening ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
+        logger.error(`Error opening ${normalizeMAC(req.params.mac)}:`, err);
+        res.status(500).json({ 
+            error: err.message,
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac)
+        });
     }
 });
 
@@ -408,13 +521,18 @@ app.get('/close/:mac', async (req, res) => {
     try {
         await sendCommand(req.params.mac, { operation: 0 });
         res.json({ 
-            mac: req.params.mac, 
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac),
             command: 'close',
             timestamp: new Date().toISOString()
         });
     } catch (err) {
-        logger.error(`Error closing ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
+        logger.error(`Error closing ${normalizeMAC(req.params.mac)}:`, err);
+        res.status(500).json({ 
+            error: err.message,
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac)
+        });
     }
 });
 
@@ -422,13 +540,18 @@ app.get('/stop/:mac', async (req, res) => {
     try {
         await sendCommand(req.params.mac, { operation: 2 });
         res.json({ 
-            mac: req.params.mac, 
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac),
             command: 'stop',
             timestamp: new Date().toISOString()
         });
     } catch (err) {
-        logger.error(`Error stopping ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
+        logger.error(`Error stopping ${normalizeMAC(req.params.mac)}:`, err);
+        res.status(500).json({ 
+            error: err.message,
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac)
+        });
     }
 });
 
@@ -437,13 +560,18 @@ app.get('/target/:mac/:pos', async (req, res) => {
     try {
         await sendCommand(req.params.mac, { targetPosition: req.position });
         res.json({ 
-            mac: req.params.mac, 
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac),
             targetPosition: req.position,
             timestamp: new Date().toISOString()
         });
     } catch (err) {
-        logger.error(`Error setting target position for ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
+        logger.error(`Error setting target position for ${normalizeMAC(req.params.mac)}:`, err);
+        res.status(500).json({ 
+            error: err.message,
+            mac: req.params.mac,
+            normalizedMAC: normalizeMAC(req.params.mac)
+        });
     }
 });
 
