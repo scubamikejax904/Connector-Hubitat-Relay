@@ -1,3 +1,7 @@
+//Connector Bridge Hubitat Relay by ScubaMikeJax904
+//Ver. 2.0
+
+
 // ----- Configuration -----
 const MULTICAST_ADDR = '238.0.0.18';
 const PORT_IN = 32101;   // incoming UDP reports
