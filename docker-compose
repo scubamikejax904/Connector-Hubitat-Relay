@@ -12,5 +12,5 @@ services:
 # Environment variables for bridge connection
     environment:
       # Replace these values with your actual configuration
-      BRIDGE_IP: "192.168.1.69"
-      CONNECTOR_KEY: "79851734-00bc-44"
+      BRIDGE_IP: "xxx.xxx.xxx.xxx"
+      CONNECTOR_KEY: "xxxxxxxxx-xxxx-xx"
