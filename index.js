@@ -1,558 +1,363 @@
 //Connector Bridge Hubitat Relay by ScubaMikeJax904
-//Ver. 3.1
-
+//Ver. 4.0
 
 // ----- Configuration -----
 const MULTICAST_ADDR = '238.0.0.18';
-const PORT_IN = 32101;   // incoming UDP reports
-const PORT_OUT = 32100;  // outgoing UDP commands
-const BRIDGE_IP = process.env.BRIDGE_IP || '127.0.0.1';
-const KEY = process.env.CONNECTOR_KEY;
+const PORT_IN = 32101;    // incoming UDP reports
+const PORT_OUT = 32100;   // outgoing UDP commands
+const BRIDGE_IP = process.env.BRIDGE_IP || '238.0.0.18'; // Use multicast by default
+const KEY = process.env.CONNECTOR_KEY || '';
 const PORT_HTTP = process.env.PORT || 3069;
-const DEVICE_TIMEOUT = parseInt(process.env.DEVICE_TIMEOUT) || 300000; // 5 minutes
-const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL) || 60000; // 1 minute
-const REQUEST_TIMEOUT = parseInt(process.env.REQUEST_TIMEOUT) || 5000; // 5 seconds
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES) || 3;
-
-// Validate required environment variables
-if (!KEY) {
-    console.error('CONNECTOR_KEY environment variable is required');
-    process.exit(1);
-}
 
 const dgram = require('dgram');
 const express = require('express');
 const bodyParser = require('body-parser');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit');
-
-// ----- Logging Setup -----
-const winston = require('winston');
-const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.errors({ stack: true }),
-        winston.format.json()
-    ),
-    transports: [
-        new winston.transports.Console({
-            format: winston.format.combine(
-                winston.format.colorize(),
-                winston.format.simple()
-            )
-        }),
-        new winston.transports.File({ filename: 'app.log' })
-    ]
-});
 
 // ----- State -----
-const devices = {}; // mac => { data, lastSeen, lastCommand }
-const pendingCommands = new Map(); // msgID => { resolve, reject, timeout }
-let token = null;
+const devices = {}; // mac => last report
 let accessToken = null;
-let udpSocket = null;
-let isShuttingDown = false;
+let rawToken = null;
+const BRIDGE_DEVICE_TYPE = '02000001';
 const MOTOR_DEVICE_TYPE = '10000000';
 
-// ----- Helper Functions -----
-function isValidMAC(mac) {
-    return /^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/i.test(mac);
-}
-
-function calculateAccessToken(tokenStr, key) {
-    if (!tokenStr || !key) return null;
+// ----- AccessToken Calculation -----
+function calculateAccessToken(token, key) {
     try {
-        const cipher = crypto.createCipheriv('aes-128-ecb', Buffer.from(key.padEnd(16, '\0')), null);
-        cipher.setAutoPadding(false);
-        const tokenBuffer = Buffer.from(tokenStr.padEnd(16, '\0'));
-        let encrypted = cipher.update(tokenBuffer);
-        encrypted = Buffer.concat([encrypted, cipher.final()]);
-        return encrypted.toString('hex').toUpperCase();
+        // Ensure KEY is exactly 16 bytes
+        let keyBuffer = Buffer.from(key, 'utf8');
+        if (keyBuffer.length !== 16) {
+            // Pad or truncate to 16 bytes
+            const paddedKey = Buffer.alloc(16);
+            keyBuffer.copy(paddedKey, 0, 0, Math.min(keyBuffer.length, 16));
+            keyBuffer = paddedKey;
+        }
+        
+        // Ensure token is exactly 16 bytes
+        let tokenBuffer = Buffer.from(token, 'utf8');
+        if (tokenBuffer.length !== 16) {
+            const paddedToken = Buffer.alloc(16);
+            tokenBuffer.copy(paddedToken, 0, 0, Math.min(tokenBuffer.length, 16));
+            tokenBuffer = paddedToken;
+        }
+        
+        // AES-128-ECB encryption
+        const cipher = crypto.createCipheriv('aes-128-ecb', keyBuffer, null);
+        cipher.setAutoPadding(false); // Disable auto-padding since we're handling it manually
+        let encrypted = cipher.update(tokenBuffer, null, 'hex');
+        encrypted += cipher.final('hex');
+        return encrypted.toUpperCase();
     } catch (err) {
-        logger.error('Error calculating AccessToken:', err);
+        console.error('Error calculating AccessToken:', err);
         return null;
     }
 }
 
-function updateDeviceState(mac, data) {
-    if (!devices[mac]) {
-        devices[mac] = {};
-    }
-    devices[mac].data = data;
-    devices[mac].lastSeen = Date.now();
+// ----- Generate msgID (timestamp format) -----
+function generateMsgID() {
+    const now = new Date();
+    return now.getFullYear().toString() +
+           (now.getMonth() + 1).toString().padStart(2, '0') +
+           now.getDate().toString().padStart(2, '0') +
+           now.getHours().toString().padStart(2, '0') +
+           now.getMinutes().toString().padStart(2, '0') +
+           now.getSeconds().toString().padStart(2, '0') +
+           now.getMilliseconds().toString().padStart(3, '0');
 }
 
 // ----- UDP Setup -----
-function createUDPSocket() {
-    const socket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-    
-    socket.on('error', (err) => {
-        logger.error('UDP Socket error:', err);
-        if (!isShuttingDown) {
-            setTimeout(() => {
-                logger.info('Attempting to recreate UDP socket...');
-                initializeUDP();
-            }, 5000);
-        }
-    });
+const udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
-    socket.on('message', (msg) => {
-        try {
-            const data = JSON.parse(msg.toString());
-            logger.debug('Received UDP message:', data);
+udpSocket.on('message', (msg, rinfo) => {
+    try {
+        const data = JSON.parse(msg.toString());
+        console.log('UDP report from', rinfo.address + ':' + rinfo.port, ':', JSON.stringify(data, null, 2));
 
-            // Handle token updates
-            if ((data.msgType === 'GetDeviceListAck' || data.msgType === 'Heartbeat') && data.token) {
-                const oldToken = token;
-                token = data.token;
-                
-                // Recalculate access token if token changed
-                if (oldToken !== token && KEY) {
-                    accessToken = calculateAccessToken(token, KEY);
-                    logger.info('Token updated:', { token, accessToken: !!accessToken });
-                }
+        if (data.msgType === 'Heartbeat' && data.token) {
+            rawToken = data.token;
+            if (KEY) {
+                accessToken = calculateAccessToken(rawToken, KEY);
+                console.log('✓ Heartbeat received → AccessToken calculated:', accessToken);
+            } else {
+                console.log('⚠ Heartbeat received but KEY not set. Please set CONNECTOR_KEY environment variable.');
             }
+        }
 
-            // Handle device responses
-            if (['Report', 'WriteDeviceAck', 'ReadDeviceAck'].includes(data.msgType)) {
-                updateDeviceState(data.mac, data.data);
-                logger.info(`${data.msgType} for ${data.mac}:`, data.data);
-                
-                // Resolve pending command if exists
-                if (data.msgID && pendingCommands.has(data.msgID)) {
-                    const { resolve, timeout } = pendingCommands.get(data.msgID);
-                    clearTimeout(timeout);
-                    pendingCommands.delete(data.msgID);
-                    resolve(data);
-                }
+        if (data.msgType === 'GetDeviceListAck') {
+            rawToken = data.token;
+            if (KEY) {
+                accessToken = calculateAccessToken(rawToken, KEY);
+                console.log('✓ Device list received → AccessToken calculated:', accessToken);
             }
-        } catch (err) {
-            logger.error('Error parsing UDP message:', err);
-        }
-    });
-
-    return socket;
-}
-
-function initializeUDP() {
-    if (udpSocket) {
-        udpSocket.close();
-    }
-    
-    udpSocket = createUDPSocket();
-    
-    udpSocket.bind(PORT_IN, () => {
-        try {
-            udpSocket.addMembership(MULTICAST_ADDR);
-            logger.info(`UDP listening on ${PORT_IN}`);
-            
-            // Request device list on startup
-            setTimeout(() => {
-                requestDeviceList();
-            }, 1000);
-        } catch (err) {
-            logger.error('Error setting up UDP multicast:', err);
-        }
-    });
-}
-
-function requestDeviceList() {
-    const msg = { msgType: 'GetDeviceList', msgID: uuidv4() };
-    sendUDPMessage(msg).catch(err => {
-        logger.error('Error requesting device list:', err);
-    });
-}
-
-// ----- Send UDP Command with Promise Support -----
-function sendUDPMessage(payload, expectResponse = false) {
-    return new Promise((resolve, reject) => {
-        if (isShuttingDown) {
-            return reject(new Error('Service is shutting down'));
-        }
-
-        if (!udpSocket) {
-            return reject(new Error('UDP socket not available'));
-        }
-
-        const message = Buffer.from(JSON.stringify(payload));
-        
-        if (expectResponse) {
-            const timeout = setTimeout(() => {
-                pendingCommands.delete(payload.msgID);
-                reject(new Error('Command timeout'));
-            }, REQUEST_TIMEOUT);
-            
-            pendingCommands.set(payload.msgID, { resolve, reject, timeout });
-        }
-
-        udpSocket.send(message, PORT_OUT, BRIDGE_IP, (err) => {
-            if (err) {
-                if (expectResponse) {
-                    const pending = pendingCommands.get(payload.msgID);
-                    if (pending) {
-                        clearTimeout(pending.timeout);
-                        pendingCommands.delete(payload.msgID);
+            // Store all devices
+            if (data.data && Array.isArray(data.data)) {
+                data.data.forEach(device => {
+                    if (device.deviceType === MOTOR_DEVICE_TYPE) {
+                        devices[device.mac] = { lastSeen: new Date() };
+                        console.log('  - Motor device found:', device.mac);
                     }
-                }
-                reject(err);
-            } else if (!expectResponse) {
-                resolve();
+                });
+            }
+        }
+
+        if (data.msgType === 'Report') {
+            devices[data.mac] = {
+                ...data.data,
+                lastSeen: new Date(),
+                lastReport: data.data
+            };
+            console.log(`✓ Device ${data.mac} status updated:`, data.data);
+        }
+
+        if (data.msgType === 'WriteDeviceAck') {
+            console.log(`✓ WriteDeviceAck for ${data.mac}:`, data.data);
+            // Update device state
+            if (devices[data.mac]) {
+                devices[data.mac].lastReport = data.data;
+            }
+        }
+
+        if (data.msgType === 'ReadDeviceAck') {
+            console.log(`✓ ReadDeviceAck for ${data.mac}:`, data.data);
+            // Update device state
+            if (devices[data.mac]) {
+                devices[data.mac].lastReport = data.data;
+            }
+        }
+    } catch (err) {
+        console.error('Error parsing UDP message:', err);
+    }
+});
+
+udpSocket.on('error', (err) => {
+    console.error('UDP socket error:', err);
+});
+
+udpSocket.bind(PORT_IN, () => {
+    udpSocket.addMembership(MULTICAST_ADDR);
+    udpSocket.setBroadcast(true);
+    console.log(`✓ UDP listening on ${PORT_IN} (multicast: ${MULTICAST_ADDR})`);
+    
+    // Request device list on startup
+    setTimeout(() => {
+        console.log('\nRequesting device list from bridge...');
+        const getDeviceList = {
+            msgType: 'GetDeviceList',
+            msgID: generateMsgID()
+        };
+        const message = Buffer.from(JSON.stringify(getDeviceList));
+        udpSocket.send(message, PORT_OUT, MULTICAST_ADDR, err => {
+            if (err) {
+                console.error('Error requesting device list:', err);
+            } else {
+                console.log('✓ GetDeviceList request sent');
             }
         });
-    });
-}
+    }, 1000);
+});
 
-async function sendCommand(mac, data, retries = 0) {
+// ----- Helper to send UDP command -----
+function sendCommand(mac, data, callback) {
     if (!accessToken) {
-        throw new Error('AccessToken not ready yet');
+        const error = 'AccessToken not ready yet. Waiting for Heartbeat or GetDeviceListAck...';
+        console.log('✗', error);
+        if (callback) callback(error);
+        return;
     }
 
+    if (!KEY) {
+        const error = 'KEY not set. Please set CONNECTOR_KEY environment variable.';
+        console.log('✗', error);
+        if (callback) callback(error);
+        return;
+    }
+
+    // Commands are sent to motor devices
     const payload = {
         msgType: 'WriteDevice',
         mac,
         deviceType: MOTOR_DEVICE_TYPE,
-        msgID: uuidv4(),
-        AccessToken: accessToken,
+        AccessToken: accessToken,  // FIXED: Use 'AccessToken' not 'token'
+        msgID: generateMsgID(),
         data
     };
 
-    try {
-        const response = await sendUDPMessage(payload, true);
-        
-        // Update last command timestamp
-        if (devices[mac]) {
-            devices[mac].lastCommand = Date.now();
-        }
-        
-        return response;
-    } catch (err) {
-        if (retries < MAX_RETRIES) {
-            logger.warn(`Command failed, retrying (${retries + 1}/${MAX_RETRIES}):`, err.message);
-            await new Promise(resolve => setTimeout(resolve, 1000 * (retries + 1)));
-            return sendCommand(mac, data, retries + 1);
-        }
-        throw err;
-    }
-}
+    console.log('\n→ Sending command:', JSON.stringify(payload, null, 2));
 
-// ----- Cleanup Function -----
-function cleanupStaleDevices() {
-    const now = Date.now();
-    let cleaned = 0;
-    
-    Object.keys(devices).forEach(mac => {
-        if (devices[mac].lastSeen && now - devices[mac].lastSeen > DEVICE_TIMEOUT) {
-            delete devices[mac];
-            cleaned++;
+    const message = Buffer.from(JSON.stringify(payload));
+    udpSocket.send(message, PORT_OUT, MULTICAST_ADDR, err => {
+        if (err) {
+            console.error('✗ UDP send error:', err);
+            if (callback) callback(err);
+        } else {
+            console.log(`✓ Command sent successfully to ${mac}`);
+            if (callback) callback(null);
         }
     });
-    
-    if (cleaned > 0) {
-        logger.info(`Cleaned up ${cleaned} stale devices`);
-    }
+}
+
+// ----- Helper to query device status -----
+function queryDeviceStatus(mac, callback) {
+    const payload = {
+        msgType: 'ReadDevice',
+        mac,
+        deviceType: MOTOR_DEVICE_TYPE,
+        msgID: generateMsgID()
+    };
+
+    console.log('\n→ Querying device status:', JSON.stringify(payload, null, 2));
+
+    const message = Buffer.from(JSON.stringify(payload));
+    udpSocket.send(message, PORT_OUT, MULTICAST_ADDR, err => {
+        if (err) {
+            console.error('✗ UDP send error:', err);
+            if (callback) callback(err);
+        } else {
+            console.log(`✓ Status query sent to ${mac}`);
+            if (callback) callback(null);
+        }
+    });
 }
 
 // ----- HTTP Setup -----
 const app = express();
-
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // limit each IP to 100 requests per windowMs
-    message: 'Too many requests from this IP'
-});
-
-app.use(limiter);
 app.use(bodyParser.json());
 
-// Request logging middleware
-app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.path}`, { ip: req.ip, userAgent: req.get('User-Agent') });
-    next();
-});
-
-// MAC address validation middleware
-app.param('mac', (req, res, next, mac) => {
-    if (!isValidMAC(mac)) {
-        return res.status(400).json({ 
-            error: 'Invalid MAC address format',
-            expected: 'XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX'
-        });
-    }
-    next();
-});
-
-// Position validation middleware
-app.param('pos', (req, res, next, pos) => {
-    const position = parseInt(pos);
-    if (isNaN(position) || position < 0 || position > 100) {
-        return res.status(400).json({ 
-            error: 'Invalid position',
-            expected: 'Integer between 0 and 100'
-        });
-    }
-    req.position = position;
-    next();
-});
-
-// ----- Health Check -----
-app.get('/health', (req, res) => {
-    const health = {
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        accessToken: !!accessToken,
-        udpSocket: !!udpSocket,
-        deviceCount: Object.keys(devices).length,
-        pendingCommands: pendingCommands.size
-    };
-    
-    if (!accessToken || !udpSocket) {
-        health.status = 'degraded';
-        return res.status(503).json(health);
-    }
-    
-    res.json(health);
-});
-
-// ----- API Endpoints -----
-
-// Ping (legacy endpoint)
+// Ping endpoint
 app.get('/ping', (req, res) => {
-    res.json({ status: 'ok', accessToken: !!accessToken });
+    res.json({ 
+        status: 'ok', 
+        accessToken: accessToken ? 'ready' : 'waiting',
+        hasKey: !!KEY,
+        deviceCount: Object.keys(devices).length
+    });
 });
 
 // List all devices
 app.get('/devices', (req, res) => {
+    console.log('\nHTTP GET /devices');
     res.json({
-        devices,
-        count: Object.keys(devices).length,
-        timestamp: new Date().toISOString()
+        devices: devices,
+        accessToken: accessToken ? 'ready' : 'waiting'
     });
 });
 
-// Refresh all devices
-app.post('/devices/refresh', async (req, res) => {
-    try {
-        const refreshPromises = Object.keys(devices).map(mac => 
-            sendCommand(mac, { operation: 5 }).catch(err => {
-                logger.warn(`Failed to refresh device ${mac}:`, err.message);
-                return { mac, error: err.message };
-            })
-        );
-        
-        const results = await Promise.allSettled(refreshPromises);
-        res.json({
-            message: 'Refresh commands sent',
-            results: results.map(r => r.value || r.reason),
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error('Error refreshing devices:', err);
-        res.status(500).json({ error: 'Failed to refresh devices' });
-    }
-});
-
-// Get device status
-app.get('/status/:mac', async (req, res) => {
+// Status for a single device
+app.get('/status/:mac', (req, res) => {
     const { mac } = req.params;
+    console.log(`\nHTTP GET /status/${mac}`);
     
-    try {
-        // Send status request
-        await sendCommand(mac, { operation: 5 });
-        
-        // Return current known state
-        const deviceData = devices[mac];
-        if (!deviceData) {
-            return res.status(404).json({ 
-                error: 'Device not found or not responding',
-                mac 
-            });
+    queryDeviceStatus(mac, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
         }
-        
-        res.json({
-            mac,
-            data: deviceData.data,
-            lastSeen: deviceData.lastSeen,
-            lastCommand: deviceData.lastCommand,
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error(`Error getting status for ${mac}:`, err);
-        res.status(500).json({ 
-            error: 'Failed to get device status',
-            message: err.message,
-            mac 
-        });
-    }
-});
-
-// Device control endpoints
-app.get('/open/:mac', async (req, res) => {
-    try {
-        await sendCommand(req.params.mac, { operation: 1 });
-        res.json({ 
-            mac: req.params.mac, 
-            command: 'open',
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error(`Error opening ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/close/:mac', async (req, res) => {
-    try {
-        await sendCommand(req.params.mac, { operation: 0 });
-        res.json({ 
-            mac: req.params.mac, 
-            command: 'close',
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error(`Error closing ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.get('/stop/:mac', async (req, res) => {
-    try {
-        await sendCommand(req.params.mac, { operation: 2 });
-        res.json({ 
-            mac: req.params.mac, 
-            command: 'stop',
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error(`Error stopping ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Set target position
-app.get('/target/:mac/:pos', async (req, res) => {
-    try {
-        await sendCommand(req.params.mac, { targetPosition: req.position });
-        res.json({ 
-            mac: req.params.mac, 
-            targetPosition: req.position,
-            timestamp: new Date().toISOString()
-        });
-    } catch (err) {
-        logger.error(`Error setting target position for ${req.params.mac}:`, err);
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// Raw device data (debug)
-app.get('/raw', (req, res) => {
-    res.json({
-        devices,
-        token,
-        accessToken: !!accessToken,
-        pendingCommands: Array.from(pendingCommands.keys()),
-        timestamp: new Date().toISOString()
+        // Return current cached status
+        res.json(devices[mac] || { error: 'unknown device', mac });
     });
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-    logger.error('Unhandled error:', err);
-    res.status(500).json({ 
-        error: 'Internal server error',
-        message: process.env.NODE_ENV === 'development' ? err.message : undefined
+// Open endpoint
+app.get('/open/:mac', (req, res) => {
+    const { mac } = req.params;
+    console.log(`\nHTTP GET /open/${mac}`);
+    
+    sendCommand(mac, { operation: 1 }, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, command: 'open', status: 'sent' });
     });
 });
 
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({ error: 'Endpoint not found' });
+// Close endpoint
+app.get('/close/:mac', (req, res) => {
+    const { mac } = req.params;
+    console.log(`\nHTTP GET /close/${mac}`);
+    
+    sendCommand(mac, { operation: 0 }, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, command: 'close', status: 'sent' });
+    });
 });
 
-// ----- Startup and Cleanup -----
-let server;
-let cleanupTimer;
-
-function startServices() {
-    // Initialize UDP
-    initializeUDP();
+// Stop endpoint
+app.get('/stop/:mac', (req, res) => {
+    const { mac } = req.params;
+    console.log(`\nHTTP GET /stop/${mac}`);
     
-    // Start cleanup timer
-    cleanupTimer = setInterval(cleanupStaleDevices, CLEANUP_INTERVAL);
-    
-    // Start HTTP server
-    server = app.listen(PORT_HTTP, () => {
-        logger.info(`HTTP API running at http://localhost:${PORT_HTTP}`);
-        logger.info('Waiting for token from bridge...');
+    sendCommand(mac, { operation: 2 }, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, command: 'stop', status: 'sent' });
     });
-    
-    server.on('error', (err) => {
-        logger.error('HTTP server error:', err);
-        process.exit(1);
-    });
-}
+});
 
-function gracefulShutdown(signal) {
-    logger.info(`Received ${signal}, shutting down gracefully...`);
-    isShuttingDown = true;
+// Target position (0=open, 100=closed)
+app.get('/target/:mac/:pos', (req, res) => {
+    const { mac, pos } = req.params;
+    console.log(`\nHTTP GET /target/${mac}/${pos}`);
     
-    // Clear timers
-    if (cleanupTimer) {
-        clearInterval(cleanupTimer);
+    const position = parseInt(pos);
+    if (isNaN(position) || position < 0 || position > 100) {
+        return res.status(400).json({ error: 'Invalid target position 0-100' });
     }
     
-    // Clear pending commands
-    pendingCommands.forEach(({ reject, timeout }) => {
-        clearTimeout(timeout);
-        reject(new Error('Service shutting down'));
+    sendCommand(mac, { targetPosition: position }, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, targetPosition: position, status: 'sent' });
     });
-    pendingCommands.clear();
-    
-    // Close HTTP server
-    if (server) {
-        server.close(() => {
-            logger.info('HTTP server closed');
-        });
-    }
-    
-    // Close UDP socket
-    if (udpSocket) {
-        udpSocket.close(() => {
-            logger.info('UDP socket closed');
-        });
-    }
-    
-    setTimeout(() => {
-        logger.info('Shutdown complete');
-        process.exit(0);
-    }, 1000);
-}
-
-// Handle shutdown signals
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (err) => {
-    logger.error('Uncaught exception:', err);
-    gracefulShutdown('uncaughtException');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-    logger.error('Unhandled rejection at:', promise, 'reason:', reason);
+// Target angle (0-180 for Venetian/Vertical blinds)
+app.get('/angle/:mac/:angle', (req, res) => {
+    const { mac, angle } = req.params;
+    console.log(`\nHTTP GET /angle/${mac}/${angle}`);
+    
+    const targetAngle = parseInt(angle);
+    if (isNaN(targetAngle) || targetAngle < 0 || targetAngle > 180) {
+        return res.status(400).json({ error: 'Invalid target angle 0-180' });
+    }
+    
+    sendCommand(mac, { targetAngle: targetAngle }, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, targetAngle: targetAngle, status: 'sent' });
+    });
 });
 
-// Start the application
-startServices();
+// Start HTTP server
+app.listen(PORT_HTTP, () => {
+    console.log('\n' + '='.repeat(60));
+    console.log('Connector WLAN Integration API Server');
+    console.log('='.repeat(60));
+    console.log(`✓ HTTP API running at http://localhost:${PORT_HTTP}`);
+    console.log(`✓ Multicast address: ${MULTICAST_ADDR}`);
+    console.log(`✓ Listening on port: ${PORT_IN}`);
+    console.log(`✓ Sending to port: ${PORT_OUT}`);
+    
+    if (!KEY) {
+        console.log('\n⚠ WARNING: CONNECTOR_KEY not set!');
+        console.log('  Please set the environment variable:');
+        console.log('  export CONNECTOR_KEY="your-16-char-key"');
+        console.log('  (Get KEY by tapping "About" page 5 times in Connector APP)');
+    } else {
+        console.log(`✓ KEY configured: ${KEY.substring(0, 4)}...`);
+    }
+    
+    console.log('\n→ Waiting for Heartbeat or GetDeviceListAck to receive token...');
+    console.log('='.repeat(60) + '\n');
+});
 
-logger.info('Application started', {
-    bridgeIP: BRIDGE_IP,
-    httpPort: PORT_HTTP,
-    udpPortIn: PORT_IN,
-    udpPortOut: PORT_OUT,
-    deviceTimeout: DEVICE_TIMEOUT,
-    cleanupInterval: CLEANUP_INTERVAL
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n\nShutting down gracefully...');
+    udpSocket.close();
+    process.exit(0);
 });
