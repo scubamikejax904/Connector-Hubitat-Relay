@@ -42,7 +42,7 @@ def refresh() {
 def pingBridge() {
     if (!serverIP || !serverPort) return
     if (logEnable) log.debug "Pinging Node.js bridge..."
-    def url = "http://${serverIP}:${serverPort}/health"
+    def url = "http://${serverIP}:${serverPort}/ping"
     try {
         httpGet(uri: url, timeout: 20) { resp ->
             if(resp.status == 200 && resp.data?.status == "ok") {
