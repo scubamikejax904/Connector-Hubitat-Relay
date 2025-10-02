@@ -1,7 +1,9 @@
 //Ver4.0
 
 metadata {
-    definition(name: "Connector Bridge Roller Child", namespace: "Connector", author: "ScubaMikeJax904") {
+    definition(name: "Connector Bridge Roller Child", namespace: "Connector", author: "ScubaMikeJax904", 
+               importUrl: "https://raw.githubusercontent.com/scubamikejax904/Connector-Hubitat-Relay/refs/heads/main/Hubitat%20Connector%20Bridge%20Roller%20Child" )
+    {
         capability "WindowShade"
         capability "Switch"
         capability "SwitchLevel"
