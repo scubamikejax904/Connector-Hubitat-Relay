@@ -3,7 +3,9 @@
 import groovy.json.JsonSlurper
 
 metadata {
-    definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904") {
+    definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904", 
+               importUrl: "https://raw.githubusercontent.com/scubamikejax904/Connector-Hubitat-Relay/refs/heads/main/Hubitat%20Connector%20Bridge" )
+    {
         capability "Refresh"
         command "refreshDevices"
         command "pingBridge"
