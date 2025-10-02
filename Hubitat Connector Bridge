@@ -1,5 +1,6 @@
+//Ver4.0
+
 import groovy.json.JsonSlurper
-import groovy.json.JsonBuilder
 
 metadata {
     definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904") {
@@ -41,15 +42,15 @@ def refresh() {
 def pingBridge() {
     if (!serverIP || !serverPort) return
     if (logEnable) log.debug "Pinging Node.js bridge..."
-    def url = "http://${serverIP}:${serverPort}/devices"  // use /devices for health check
+    def url = "http://${serverIP}:${serverPort}/health"
     try {
-        httpGet(url) { resp ->
-            if(resp.status == 200) {
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(resp.status == 200 && resp.data?.status == "ok") {
                 if (logEnable) log.debug "Bridge ping OK"
                 sendEvent(name: "bridgeStatus", value: "ok")
                 getChildDevices().each { it.sendEvent(name: "online", value: "online") }
             } else {
-                log.warn "Bridge ping returned HTTP ${resp.status}"
+                log.warn "Bridge ping returned HTTP ${resp.status} or degraded status"
                 sendEvent(name: "bridgeStatus", value: "offline")
                 getChildDevices().each { it.markOffline() }
             }
@@ -80,7 +81,7 @@ def schedulePing() {
 
 // ------------------- Device Discovery -------------------
 def refreshDevices() {
-    if (logEnable) log.debug "Refreshing devices from Node.js server (httpGet)"
+    if (logEnable) log.debug "Refreshing devices from Node.js server"
     if (!serverIP || !serverPort) {
         log.error "Server IP or Port not set"
         return
@@ -88,15 +89,13 @@ def refreshDevices() {
 
     def url = "http://${serverIP}:${serverPort}/devices"
     try {
-        httpGet(url) { resp ->
-            if(resp.status == 200 && resp.data?.data) {
-                // Flatten in case server returns nested arrays
-                def deviceList = resp.data.data.flatten()
-                
-                deviceList.each { deviceInfo ->
-                    // Handle both Map objects (with mac) and strings
-                    def mac = (deviceInfo instanceof Map) ? deviceInfo.mac : deviceInfo
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(resp.status == 200 && resp.data?.devices) {
+                def deviceMap = resp.data.devices
+                deviceMap.each { mac, deviceInfo ->
                     if(!mac) return
+
+                    if(logEnable) log.debug "Found device with MAC: ${mac}"
 
                     def child = getChildDevice(mac)
                     if(!child) {
@@ -105,10 +104,11 @@ def refreshDevices() {
                             "Connector",
                             "Connector Bridge Roller Child",
                             mac,
-                            [label: (deviceInfo instanceof Map ? deviceInfo.friendlyName : "Blind ${mac}"), isComponent: false]
+                            [label: "Blind ${mac}", isComponent: false]
                         )
                     }
 
+                    // Request initial status
                     requestStatus(mac)
                 }
 
@@ -131,8 +131,9 @@ def refreshDevices() {
 def requestStatus(mac) {
     def url = "http://${serverIP}:${serverPort}/status/${mac}"
     if(logEnable) log.debug "Requesting status for ${mac}"
+
     try {
-        httpGet(url) { resp ->
+        httpGet(uri: url, timeout: 20) { resp ->
             if(resp.status == 200 && resp.data) {
                 updateChildState(mac, resp.data)
             } else {
@@ -140,7 +141,7 @@ def requestStatus(mac) {
             }
         }
     } catch(Exception e) {
-        log.error "Status request error for ${mac}: ${e.message}"
+        log.warn "Status request error for ${mac}: ${e.message}"
     }
 }
 
@@ -150,27 +151,65 @@ def updateChildState(mac, data) {
     if(child) {
         child.updateStateFromParent(data)
         if(logEnable) {
-            def pos = data.currentPosition != null ? "${data.currentPosition}%" : "?"
-            def batt = data.batteryLevel != null ? "${data.batteryLevel}%" : "?"
-            def rssi = data.raw?.RSSI != null ? "${data.raw.RSSI} dBm" : "?"
+            def deviceData = data.data ?: [:]
+            def pos = deviceData.currentPosition != null ? "${deviceData.currentPosition}%" : "?"
+            def batt = deviceData.batteryLevel != null ? "${deviceData.batteryLevel}%" : "?"
             def shadeState = child.currentValue("windowShade") ?: "?"
-            log.debug "Updated ${child.displayName} → pos=${pos}, shade=${shadeState}, battery=${batt}, rssi=${rssi}"
+            log.debug "Updated ${child.displayName} → pos=${pos}, shade=${shadeState}, battery=${batt}"
         }
     }
 }
 
-// ------------------- Move Commands -------------------
-def sendMoveCommand(mac, Map body) {
-    def url = "http://${serverIP}:${serverPort}/move/${mac}"
-    def jsonBody = new JsonBuilder(body).toString()
-    if(logEnable) log.debug "Sending POST to ${url} → ${jsonBody}"
+// ------------------- Device Commands -------------------
+def sendOpenCommand(mac) {
+    def url = "http://${serverIP}:${serverPort}/open/${mac}"
+    if(logEnable) log.debug "Sending open command to ${mac}"
     
     try {
-        httpPost(uri: url, body: jsonBody, requestContentType: "application/json") { resp ->
-            if(logEnable) log.debug "Move response for ${mac}: HTTP ${resp.status} → ${resp.data}"
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(logEnable) log.debug "Open command response for ${mac}: HTTP ${resp.status}"
         }
     } catch(Exception e) {
-        log.error "Move command error for ${mac}: ${e.message}"
+        log.error "Open command error for ${mac}: ${e.message}"
+    }
+}
+
+def sendCloseCommand(mac) {
+    def url = "http://${serverIP}:${serverPort}/close/${mac}"
+    if(logEnable) log.debug "Sending close command to ${mac}"
+    
+    try {
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(logEnable) log.debug "Close command response for ${mac}: HTTP ${resp.status}"
+        }
+    } catch(Exception e) {
+        log.error "Close command error for ${mac}: ${e.message}"
+    }
+}
+
+def sendStopCommand(mac) {
+    def url = "http://${serverIP}:${serverPort}/stop/${mac}"
+    if(logEnable) log.debug "Sending stop command to ${mac}"
+    
+    try {
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(logEnable) log.debug "Stop command response for ${mac}: HTTP ${resp.status}"
+        }
+    } catch(Exception e) {
+        log.error "Stop command error for ${mac}: ${e.message}"
+    }
+}
+
+def sendTargetCommand(mac, position) {
+    def url = "http://${serverIP}:${serverPort}/target/${mac}/${position}"
+    if(logEnable) log.debug "Sending target position ${position} to ${mac}"
+    
+    try {
+        httpGet(uri: url, timeout: 20) { resp ->
+            if(logEnable) log.debug "Target command response for ${mac}: HTTP ${resp.status}"
+        }
+    } catch(Exception e) {
+        log.error "Target command error for ${mac}: ${e.message}"
     }
 }
 
