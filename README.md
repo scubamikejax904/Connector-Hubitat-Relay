@@ -4,6 +4,7 @@ This code is free use
 
 What you'll need, 
 
+     working docker (you can use my prebuilt docker image scubamikejax904/connectorrelay:latest, with the docker-compose in this repository. You can use the index.js and run it on a node server with PM2 if you prefer that way.
      App Key (on about screen tap 5 times) this will be a 16 digit number including (-'s)
      Bridge IP Address
      Hubitat Bridge Driver
