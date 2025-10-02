@@ -1,3 +1,5 @@
+//Ver4.0
+
 metadata {
     definition(name: "Connector Bridge Roller Child", namespace: "Connector", author: "ScubaMikeJax904") {
         capability "WindowShade"
@@ -14,33 +16,27 @@ metadata {
     }
 }
 
-// Alias for Hubitat setPosition
-def setPosition(pos) {
-    setLevel(pos as int)
-}
-
+// ------------------- Capability Commands -------------------
 def open() {
-    parent.sendMoveCommand(device.deviceNetworkId, [operation: 1])
+    parent.sendOpenCommand(device.deviceNetworkId)
     sendEvent(name: "windowShade", value: "opening")
     sendEvent(name: "switch", value: "on")
-    sendEvent(name: "level", value: 0)
 }
 
 def close() {
-    parent.sendMoveCommand(device.deviceNetworkId, [operation: 0])
+    parent.sendCloseCommand(device.deviceNetworkId)
     sendEvent(name: "windowShade", value: "closing")
     sendEvent(name: "switch", value: "off")
-    sendEvent(name: "level", value: 100)
 }
 
 def stop() {
-    parent.sendMoveCommand(device.deviceNetworkId, [operation: 2])
+    parent.sendStopCommand(device.deviceNetworkId)
     sendEvent(name: "windowShade", value: "partially open")
 }
 
 def setLevel(level) {
     level = Math.max(Math.min(level as int, 100), 0)
-    parent.sendMoveCommand(device.deviceNetworkId, [targetPosition: level])
+    parent.sendTargetCommand(device.deviceNetworkId, level)
     sendEvent(name: "level", value: level)
 
     if (level == 0) {
@@ -55,14 +51,22 @@ def setLevel(level) {
     }
 }
 
+// Alias for Hubitat setPosition
+def setPosition(pos) {
+    setLevel(pos as int)
+}
+
 def refresh() {
     parent.requestStatus(device.deviceNetworkId)
 }
 
-// ------------------- Update State from Parent -------------------
-def updateStateFromParent(data) {
-    if(!data) return
-
+// ------------------- State Updates from Parent -------------------
+def updateStateFromParent(responseData) {
+    if(!responseData?.data) return
+    
+    def data = responseData.data
+    
+    // Handle current position
     if(data.currentPosition != null) {
         def pos = data.currentPosition as int
         sendEvent(name: "level", value: pos)
@@ -78,19 +82,52 @@ def updateStateFromParent(data) {
             sendEvent(name: "switch", value: "on")
         }
     }
+    
+    // Handle target position (if different from current)
+    if(data.targetPosition != null && data.currentPosition == null) {
+        def pos = data.targetPosition as int
+        sendEvent(name: "level", value: pos)
 
-    if(data.batteryLevel != null) sendEvent(name: "battery", value: data.batteryLevel as int)
-    if(data.raw?.RSSI != null) sendEvent(name: "rssi", value: data.raw.RSSI as int)
-
-    // Map Motionblinds currentState
-    if(data.raw?.currentState != null) {
-        switch(data.raw.currentState as int) {
-            case 1: sendEvent(name: "windowShade", value: "opening"); break
-            case 2: sendEvent(name: "windowShade", value: "closing"); break
-            case 3: /* idle, leave level as-is */ break
+        if(pos == 0) {
+            sendEvent(name: "windowShade", value: "opening")
+            sendEvent(name: "switch", value: "on")
+        } else if(pos == 100) {
+            sendEvent(name: "windowShade", value: "closing")
+            sendEvent(name: "switch", value: "off")
+        } else {
+            sendEvent(name: "windowShade", value: "partially open")
+            sendEvent(name: "switch", value: "on")
         }
     }
 
+    // Handle operation status: 0=close, 1=open, 2=stop
+    if(data.operation != null) {
+        switch(data.operation as int) {
+            case 0: 
+                sendEvent(name: "windowShade", value: "closing")
+                break
+            case 1: 
+                sendEvent(name: "windowShade", value: "opening")
+                break
+            case 2: 
+                sendEvent(name: "windowShade", value: "partially open")
+                break
+        }
+    }
+
+    // Handle battery level
+    if(data.batteryLevel != null) {
+        sendEvent(name: "battery", value: data.batteryLevel as int)
+    }
+    
+    // Handle RSSI if available
+    if(data.rssi != null) {
+        sendEvent(name: "rssi", value: data.rssi as int)
+    } else if(data.raw?.RSSI != null) {
+        sendEvent(name: "rssi", value: data.raw.RSSI as int)
+    }
+
+    // Update timestamps and online status
     sendEvent(name: "lastUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
     sendEvent(name: "online", value: "online")
 }
