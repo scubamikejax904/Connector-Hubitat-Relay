@@ -1,41 +1,29 @@
-# Multi-stage build for smaller image
-FROM node:18-alpine AS builder
+e Node.js LTS
+FROM node:20-alpine
 
+# Set working directory
 WORKDIR /app
 
-# Copy package files
+# Copy package.json and package-lock.json if exists
 COPY package*.json ./
 
-# Install dependencies (use npm install if no package-lock.json exists)
-RUN npm install --only=production
+# Install dependencies
+RUN npm install
 
-# Final stage
-FROM node:18-alpine
-
-WORKDIR /app
-
-# Copy only necessary files from builder
-COPY --from=builder /app/node_modules ./node_modules
-COPY package*.json ./
-COPY index.js ./
-
-# Run as non-root user for security
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S nodejs -u 1001 && \
-    chown -R nodejs:nodejs /app
-
-USER nodejs
+# Copy all source code
+COPY . .
 
 # Expose HTTP port
 EXPOSE 3069
-EXPOSE 32101/udp
-EXPOSE 32100/udp
 
-# Set environment variables (can be overridden)
-ENV PORT=3069
-ENV BRIDGE_IP=127.0.0.1
-ENV CONNECTOR_KEY=""
-ENV NODE_ENV=production
+# Set environment variables defaults
+ENV BRIDGE_IP=192.168.1.69
+ENV CONNECTOR_KEY=YOUR_KEY_HERE
+ENV DEVICE_TIMEOUT=300000
+ENV CLEANUP_INTERVAL=60000
+ENV REQUEST_TIMEOUT=5000
+ENV MAX_RETRIES=3
+ENV LOG_LEVEL=info
 
-# Run the application
+# Start the application
 CMD ["node", "index.js"]
