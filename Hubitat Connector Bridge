@@ -1,16 +1,14 @@
-//Ver4.0
-
-import groovy.json.JsonSlurper
+//Ver4.1
+import groovy.json.JsonBuilder
 
 metadata {
-    definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904", 
-               importUrl: "https://raw.githubusercontent.com/scubamikejax904/Connector-Hubitat-Relay/refs/heads/main/Hubitat%20Connector%20Bridge" )
-    {
+    definition(name: "Connector Bridge (HTTP)", namespace: "Connector", author: "ScubaMikeJax904") {
         capability "Refresh"
         command "refreshDevices"
         command "pingBridge"
         attribute "bridgeStatus", "string"
         attribute "lastDiscovery", "string"
+        attribute "webhookStatus", "string"
     }
 }
 
@@ -20,6 +18,7 @@ preferences {
     input name: "pollInterval", type: "number", title: "Polling interval (minutes)", defaultValue: 5, required: true
     input name: "pingInterval", type: "number", title: "Bridge health check interval (minutes)", defaultValue: 1, required: true
     input name: "logEnable", type: "bool", title: "Enable Debug Logging?", defaultValue: true
+    input name: "useWebhook", type: "bool", title: "Enable webhook for real-time updates", defaultValue: true
 }
 
 // ------------------- Initialization -------------------
@@ -27,6 +26,7 @@ def installed() {
     refreshDevices()
     schedulePolling()
     schedulePing()
+    registerWebhook()
 }
 
 def updated() {
@@ -34,6 +34,7 @@ def updated() {
     refreshDevices()
     schedulePolling()
     schedulePing()
+    registerWebhook()
 }
 
 def refresh() {
@@ -44,15 +45,15 @@ def refresh() {
 def pingBridge() {
     if (!serverIP || !serverPort) return
     if (logEnable) log.debug "Pinging Node.js bridge..."
-    def url = "http://${serverIP}:${serverPort}/ping"
+    def url = "http://${serverIP}:${serverPort}/devices"  // use /devices for health check
     try {
-        httpGet(uri: url, timeout: 20) { resp ->
-            if(resp.status == 200 && resp.data?.status == "ok") {
+        httpGet(url) { resp ->
+            if(resp.status == 200) {
                 if (logEnable) log.debug "Bridge ping OK"
                 sendEvent(name: "bridgeStatus", value: "ok")
                 getChildDevices().each { it.sendEvent(name: "online", value: "online") }
             } else {
-                log.warn "Bridge ping returned HTTP ${resp.status} or degraded status"
+                log.warn "Bridge ping returned HTTP ${resp.status}"
                 sendEvent(name: "bridgeStatus", value: "offline")
                 getChildDevices().each { it.markOffline() }
             }
@@ -81,9 +82,74 @@ def schedulePing() {
     }
 }
 
+// ------------------- Webhook Registration -------------------
+def registerWebhook() {
+    if (!useWebhook) {
+        if (logEnable) log.debug "Webhook disabled in preferences"
+        sendEvent(name: "webhookStatus", value: "disabled")
+        return
+    }
+    
+    if (!serverIP || !serverPort) {
+        log.warn "Cannot register webhook - server IP or port not set"
+        sendEvent(name: "webhookStatus", value: "error")
+        return
+    }
+
+    // Generate the callback URL that Hubitat will expose
+    def callbackUrl = getHubitatCallbackUrl()
+    
+    if (logEnable) log.debug "Registering webhook: ${callbackUrl}"
+    
+    try {
+        def url = "http://${serverIP}:${serverPort}/webhook"
+        def body = [callbackUrl: callbackUrl]
+        
+        httpPost(uri: url, body: new JsonBuilder(body).toString(), requestContentType: "application/json") { resp ->
+            if (resp.status == 200) {
+                log.info "✓ Webhook registered successfully"
+                sendEvent(name: "webhookStatus", value: "registered")
+            } else {
+                log.warn "Webhook registration returned HTTP ${resp.status}"
+                sendEvent(name: "webhookStatus", value: "error")
+            }
+        }
+    } catch(Exception e) {
+        log.error "Failed to register webhook: ${e.message}"
+        sendEvent(name: "webhookStatus", value: "error")
+    }
+}
+
+def getHubitatCallbackUrl() {
+    // Generate a unique callback URL for this bridge instance
+    // Uses Hubitat's built-in URL generation
+    def callbackPath = "/callback/connector-bridge-${device.id}"
+    return "http://${location.hub.localIP}:39500${callbackPath}"
+}
+
+// ------------------- Webhook Callback Handler -------------------
+def callback() {
+    def params = request.JSON
+    if (logEnable) log.debug "Webhook callback received: ${params}"
+    
+    def mac = params?.mac
+    def data = params?.data
+    
+    if (!mac || !data) {
+        log.warn "Invalid webhook payload - missing mac or data"
+        render contentType: "text/plain", data: "Invalid payload", status: 400
+        return
+    }
+    
+    // Update child device state immediately
+    updateChildState(mac, data)
+    
+    render contentType: "text/plain", data: "OK", status: 200
+}
+
 // ------------------- Device Discovery -------------------
 def refreshDevices() {
-    if (logEnable) log.debug "Refreshing devices from Node.js server"
+    if (logEnable) log.debug "Refreshing devices from Node.js server (httpGet)"
     if (!serverIP || !serverPort) {
         log.error "Server IP or Port not set"
         return
@@ -91,13 +157,18 @@ def refreshDevices() {
 
     def url = "http://${serverIP}:${serverPort}/devices"
     try {
-        httpGet(uri: url, timeout: 20) { resp ->
+        httpGet(url) { resp ->
             if(resp.status == 200 && resp.data?.devices) {
-                def deviceMap = resp.data.devices
-                deviceMap.each { mac, deviceInfo ->
+                def deviceList = []
+                
+                // Handle devices object with mac keys
+                resp.data.devices.each { mac, deviceData ->
+                    deviceList << [mac: mac, friendlyName: deviceData?.friendlyName ?: "Blind ${mac}"]
+                }
+                
+                deviceList.each { deviceInfo ->
+                    def mac = deviceInfo.mac
                     if(!mac) return
-
-                    if(logEnable) log.debug "Found device with MAC: ${mac}"
 
                     def child = getChildDevice(mac)
                     if(!child) {
@@ -106,12 +177,14 @@ def refreshDevices() {
                             "Connector",
                             "Connector Bridge Roller Child",
                             mac,
-                            [label: "Blind ${mac}", isComponent: false]
+                            [label: deviceInfo.friendlyName, isComponent: false]
                         )
                     }
 
-                    // Request initial status
-                    requestStatus(mac)
+                    // Request initial status for new devices
+                    if (!child) {
+                        requestStatus(mac)
+                    }
                 }
 
                 sendEvent(
@@ -133,9 +206,8 @@ def refreshDevices() {
 def requestStatus(mac) {
     def url = "http://${serverIP}:${serverPort}/status/${mac}"
     if(logEnable) log.debug "Requesting status for ${mac}"
-
     try {
-        httpGet(uri: url, timeout: 20) { resp ->
+        httpGet(url) { resp ->
             if(resp.status == 200 && resp.data) {
                 updateChildState(mac, resp.data)
             } else {
@@ -143,7 +215,7 @@ def requestStatus(mac) {
             }
         }
     } catch(Exception e) {
-        log.warn "Status request error for ${mac}: ${e.message}"
+        log.error "Status request error for ${mac}: ${e.message}"
     }
 }
 
@@ -153,72 +225,47 @@ def updateChildState(mac, data) {
     if(child) {
         child.updateStateFromParent(data)
         if(logEnable) {
-            def deviceData = data.data ?: [:]
-            def pos = deviceData.currentPosition != null ? "${deviceData.currentPosition}%" : "?"
-            def batt = deviceData.batteryLevel != null ? "${deviceData.batteryLevel}%" : "?"
+            def pos = data.currentPosition != null ? "${data.currentPosition}%" : "?"
+            def batt = data.batteryLevel != null ? "${data.batteryLevel}%" : "?"
+            def rssi = data.raw?.RSSI != null ? "${data.raw.RSSI} dBm" : "?"
             def shadeState = child.currentValue("windowShade") ?: "?"
-            log.debug "Updated ${child.displayName} → pos=${pos}, shade=${shadeState}, battery=${batt}"
+            log.debug "Updated ${child.displayName} → pos=${pos}, shade=${shadeState}, battery=${batt}, rssi=${rssi}"
+        }
+    } else {
+        if(logEnable) log.debug "Child device ${mac} not found, creating..."
+        // Auto-create child if it doesn't exist
+        addChildDevice(
+            "Connector",
+            "Connector Bridge Roller Child",
+            mac,
+            [label: "Blind ${mac}", isComponent: false]
+        )
+        def newChild = getChildDevice(mac)
+        if(newChild) {
+            newChild.updateStateFromParent(data)
         }
     }
 }
 
-// ------------------- Device Commands -------------------
-def sendOpenCommand(mac) {
-    def url = "http://${serverIP}:${serverPort}/open/${mac}"
-    if(logEnable) log.debug "Sending open command to ${mac}"
+// ------------------- Move Commands -------------------
+def sendMoveCommand(mac, Map body) {
+    def url = "http://${serverIP}:${serverPort}/move/${mac}"
+    def jsonBody = new JsonBuilder(body).toString()
+    if(logEnable) log.debug "Sending POST to ${url} → ${jsonBody}"
     
     try {
-        httpGet(uri: url, timeout: 20) { resp ->
-            if(logEnable) log.debug "Open command response for ${mac}: HTTP ${resp.status}"
+        httpPost(uri: url, body: jsonBody, requestContentType: "application/json") { resp ->
+            if(logEnable) log.debug "Move response for ${mac}: HTTP ${resp.status} → ${resp.data}"
         }
     } catch(Exception e) {
-        log.error "Open command error for ${mac}: ${e.message}"
-    }
-}
-
-def sendCloseCommand(mac) {
-    def url = "http://${serverIP}:${serverPort}/close/${mac}"
-    if(logEnable) log.debug "Sending close command to ${mac}"
-    
-    try {
-        httpGet(uri: url, timeout: 20) { resp ->
-            if(logEnable) log.debug "Close command response for ${mac}: HTTP ${resp.status}"
-        }
-    } catch(Exception e) {
-        log.error "Close command error for ${mac}: ${e.message}"
-    }
-}
-
-def sendStopCommand(mac) {
-    def url = "http://${serverIP}:${serverPort}/stop/${mac}"
-    if(logEnable) log.debug "Sending stop command to ${mac}"
-    
-    try {
-        httpGet(uri: url, timeout: 20) { resp ->
-            if(logEnable) log.debug "Stop command response for ${mac}: HTTP ${resp.status}"
-        }
-    } catch(Exception e) {
-        log.error "Stop command error for ${mac}: ${e.message}"
-    }
-}
-
-def sendTargetCommand(mac, position) {
-    def url = "http://${serverIP}:${serverPort}/target/${mac}/${position}"
-    if(logEnable) log.debug "Sending target position ${position} to ${mac}"
-    
-    try {
-        httpGet(uri: url, timeout: 20) { resp ->
-            if(logEnable) log.debug "Target command response for ${mac}: HTTP ${resp.status}"
-        }
-    } catch(Exception e) {
-        log.error "Target command error for ${mac}: ${e.message}"
+        log.error "Move command error for ${mac}: ${e.message}"
     }
 }
 
 // ------------------- Polling -------------------
 def schedulePolling() {
     def minutes = pollInterval ?: 5
-    if(logEnable) log.debug "Scheduling polling every ${minutes} minute(s)"
+    if (logEnable) log.debug "Scheduling polling every ${minutes} minute(s)"
     unschedule("pollChildren")
     switch(minutes) {
         case 1: runEvery1Minute("pollChildren"); break
