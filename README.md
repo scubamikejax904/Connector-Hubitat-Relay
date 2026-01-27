@@ -20,344 +20,180 @@ https://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
 
-# Connector Bridge Hubitat Relay v5.0
+# Bidirectional Hubitat Integration - Setup Guide
 
 ## Overview
 
-Enhanced UDP bridge connector with comprehensive error handling and bidirectional communication support for smart home device integration.
+This modified driver adds **real-time bidirectional communication** between your Node.js bridge and Hubitat. State changes are now pushed to Hubitat immediately via webhooks instead of waiting for polling cycles.
 
-## Key Enhancements in v5.0
+## What's New in Version 4.1
 
-### 1\. **Comprehensive UDP Error Handling**
+### Changes to Node.js Bridge Driver (`hubitat-bridge-driver.js`)
 
--   **Message Validation**: Validates all incoming UDP messages for structure, size, and content
--   **Error Recovery**: Automatic retry logic for failed commands (up to 3 retries)
--   **Connection Monitoring**: Real-time tracking of bridge connection status
--   **Error Logging**: Detailed error messages with timestamps and context
+1.  **Added webhook push mechanism** - Device state updates are now pushed to Hubitat immediately
+2.  **New `/webhook` endpoint** - POST endpoint to register Hubitat's callback URL
+3.  **Environment variable support** - Can set `HUBITAT_CALLBACK_URL` or use the `/webhook` endpoint
+4.  **Enhanced logging** - Shows webhook registration status and push confirmation
 
-### 2\. **Bidirectional Communication**
+### Changes to Hubitat Bridge Driver (`hubitat-bridge-driver.groovy`)
 
--   **Request-Response Correlation**: Each command is tracked using unique msgID
--   **Callback System**: Automatic handling of bridge acknowledgments and responses
--   **Timeout Management**: 5-second timeout for command responses with automatic retry
--   **Response Tracking**: Real-time status of pending requests
+1.  **Webhook registration** - Automatically registers with Node.js bridge on startup
+2.  **Callback handler** - Receives state updates from Node.js bridge
+3.  **New preference** - "Enable webhook for real-time updates" (default: true)
+4.  **Webhook status attribute** - Shows if webhook is registered, error, or disabled
 
-### 3\. **Connection Health Monitoring**
+## Setup Instructions
 
--   **Heartbeat Detection**: Monitors bridge heartbeat messages
--   **Status Tracking**: Real-time connection status (connected/disconnected/error)
--   **Error Counting**: Tracks cumulative errors for diagnostics
--   **Automatic Recovery**: Attempts to recover from connection failures
+### Step 1: Update Node.js Bridge Driver
 
-## Configuration
+1.  **Replace your existing driver file** with `hubitat-bridge-driver.js`
+2.  **Restart your Node.js server** with the new driver
 
-```javascript
-const MULTICAST_ADDR = '238.0.0.18';    // Multicast address
-const PORT_IN = 32101;                   // Incoming UDP port
-const PORT_OUT = 32100;                  // Outgoing UDP port
-const BRIDGE_IP = '238.0.0.18';         // Bridge IP address
-const KEY = 'your-16-char-key';          // Encryption key
-const PORT_HTTP = 3069;                  // HTTP API port
-const UDP_TIMEOUT = 5000;                // Command timeout (ms)
-const MAX_RETRIES = 3;                   // Maximum retry attempts
-```
+### Step 2: Update Hubitat Bridge Driver
 
-## New Features
+1.  **In Hubitat**: Go to "Drivers Code" in the menu
+2.  **Click "New Driver"** and paste the content of `hubitat-bridge-driver.groovy`
+3.  **Save** the driver
+4.  **Replace your existing bridge device** with the new driver:
+    -   Go to your bridge device page
+    -   Click "Edit Preferences" or "Change Type"
+    -   Select "Connector Bridge (HTTP)" (the new driver)
+    -   Save
 
-### Connection Status API
+### Step 3: Configure Webhook Settings
 
-```bash
-GET /ping
-```
+1.  **Open your Hubitat bridge device preferences**
+2.  **Make sure these settings are configured**:
+    -   `serverIP`: Your Node.js server IP address
+    -   `serverPort`: 3069 (or your custom port)
+    -   `useWebhook`: ✅ **Enabled** (this is NEW - enables real-time updates)
+    -   `pollInterval`: Can remain at 5 minutes (acts as backup)
+    -   `pingInterval`: 1 minute (for health checks)
+3.  **Click "Done"** to save preferences
 
-Returns comprehensive connection status:
+### Step 4: Verify Webhook Registration
 
-```json
-{
-  "status": "ok",
-  "accessToken": "ready",
-  "hasKey": true,
-  "deviceCount": 5,
-  "connection": {
-    "connected": true,
-    "lastHeartbeat": "2024-01-15T10:30:45.123Z",
-    "errorCount": 0,
-    "lastError": null,
-    "pendingRequests": 2
-  }
-}
-```
+1.  **Check your Hubitat bridge device** - Look at the "webhookStatus" attribute
+2.  **Expected values**:
+    -   `registered` ✅ - Webhook is working correctly
+    -   `error` ❌ - Check your server IP/port and try clicking "Refresh Devices"
+    -   `disabled` ⚪ - Webhook is disabled in preferences
 
-### Enhanced Device Status
+### Step 5: Test Bidirectional Communication
 
-```bash
-GET /status/:mac
-```
+1.  **Use the Node.js server logs** to verify:
+    
+    ```
+    ✓ Hubitat webhook registered: http://192.168.x.x:39500/callback/...
+    ✓ State pushed to Hubitat for AA:BB:CC:DD:EE:FF
+    ```
+    
+2.  **Test by sending a command from Hubitat**:
+    -   Open/close a blind
+    -   Check that the state updates **immediately** in Hubitat
+    -   No need to wait for polling cycle!
+3.  **Test physical device changes**:
+    -   Manually move the blind
+    -   Check that Hubitat shows the new position **immediately**
 
-Now returns fresh data from bridge response:
+## How It Works
 
-```json
-{
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "status": {
-    "operation": 0,
-    "targetPosition": 50,
-    "currentPosition": 50
-  },
-  "timestamp": "2024-01-15T10:30:45.123Z",
-  "source": "bridge_response"
-}
-```
-
-### Command Acknowledgments
-
-All command endpoints now provide acknowledgment tracking:
-
-```json
-{
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "command": "open",
-  "status": "sent_awaiting_ack",
-  "timestamp": "2024-01-15T10:30:45.123Z",
-  "message": "Command sent, waiting for bridge acknowledgment"
-}
-```
-
-## Error Handling Features
-
-### Message Validation
-
--   Empty message detection
--   Oversized message rejection (>10KB)
--   JSON parsing error handling
--   Missing required field validation
-
-### Automatic Retry Logic
-
-Commands that fail or timeout are automatically retried:
-
-1.  First attempt: Immediate send
-2.  Retry 1: After 10 seconds if no response
-3.  Retry 2: After another 10 seconds
-4.  Retry 3: Final attempt
-5.  Failure: Callback invoked with error after max retries
-
-### Connection Status Monitoring
-
--   **Connected**: Bridge is responding to heartbeats
--   **Disconnected**: No heartbeat for 30+ seconds
--   **Error**: Communication errors detected
-
-### Error Response Format
-
-```json
-{
-  "error": "AccessToken not ready yet",
-  "mac": "AA:BB:CC:DD:EE:FF",
-  "timestamp": "2024-01-15T10:30:45.123Z"
-}
-```
-
-## Bidirectional Communication Flow
-
-### Command Flow
+### Before (Polling Only)
 
 ```
-1. Client sends HTTP request to API
-2. API generates unique msgID
-3. API sends UDP command to bridge
-4. API registers pending request with callback
-5. Bridge processes command
-6. Bridge sends acknowledgment (WriteDeviceAck/ReadDeviceAck)
-7. API receives response and correlates with msgID
-8. API invokes callback with response data
-9. Client receives HTTP response with bridge data
+Hubitat → (every 5 min) → Node.js Bridge → Get Status → Hubitat
+                                     ↓
+                              Device State
 ```
 
-### Pending Request Management
+**Problem**: 5-minute delay before Hubitat sees state changes
 
--   All commands are tracked in a Map (msgID → request info)
--   Each request has: callback, timestamp, retry count, original command
--   Health check monitors for stale requests (>5 seconds)
--   Automatic cleanup of completed/failed requests
-
-## API Endpoints
-
-### Status Endpoints
-
--   `GET /ping` - Server and connection status
--   `GET /devices` - List all discovered devices
--   `GET /status/:mac` - Get fresh device status from bridge
-
-### Control Endpoints
-
--   `GET /open/:mac` - Open device
--   `GET /close/:mac` - Close device
--   `GET /stop/:mac` - Stop device movement
--   `GET /target/:mac/:pos` - Set target position (0-100)
--   `GET /angle/:mac/:angle` - Set target angle (0-180)
-
-## Logging Improvements
-
-### Enhanced Console Output
+### After (Webhook + Polling)
 
 ```
-✓ Heartbeat received → AccessToken calculated: ABC123...
-✓ Command sent (msgID: 20240115103045123)
-✓ WriteDeviceAck for AA:BB:CC:DD:EE:FF: { operation: 0 }
-✓ Response received for request 20240115103045123
-⚠ Request 20240115103045123 timed out
-↻ Retrying command (1/3): 20240115103045123
-✗ Bridge error (1): Connection timeout
+                        (immediate push)
+Device State → Node.js Bridge → Webhook → Hubitat ✅
+                                      ↑
+                               (5 min backup polling)
 ```
 
-### Error Categories
-
--   **UDP Socket Errors**: Network-level issues
--   **Message Parsing Errors**: Invalid JSON or structure
--   **Validation Errors**: Missing or invalid data
--   **Timeout Errors**: No response from bridge
--   **Bridge Errors**: Error messages from bridge itself
-
-## Setup and Installation
-
-### Prerequisites
-
--   Node.js runtime
--   CONNECTOR\_KEY environment variable
--   Network access to multicast address
-
-### Environment Variables
-
-```bash
-export CONNECTOR_KEY="your-16-char-key"
-export BRIDGE_IP="238.0.0.18"  # Optional, defaults to multicast
-export PORT="3069"              # Optional, HTTP port
-```
-
-### Running the Server
-
-```bash
-node connector_bridge.js
-```
+**Solution**: Real-time state updates with polling as backup
 
 ## Troubleshooting
 
-### Connection Issues
+### Webhook Status Shows "error"
 
-1.  Check `/ping` endpoint for connection status
-2.  Verify CONNECTOR\_KEY is set correctly
-3.  Ensure network allows multicast traffic
-4.  Check firewall rules for UDP ports 32100/32101
+1.  **Check server IP and port** - Make sure Node.js server is running
+2.  **Check firewall** - Ensure Hubitat can reach the Node.js server
+3.  **Click "Refresh Devices"** - This will re-register the webhook
+4.  **Check Node.js logs** - Look for webhook registration errors
 
-### Command Failures
+### State Not Updating Immediately
 
-1.  Check errorCount in `/ping` response
-2.  Review console logs for specific errors
-3.  Verify device MAC addresses are correct
-4.  Ensure AccessToken is ready (check `/ping`)
+1.  **Verify webhook is registered** - Check `webhookStatus` attribute
+2.  **Check Node.js logs** - Look for "State pushed to Hubitat" messages
+3.  **Test the webhook endpoint**:
+    
+    ```bash
+    curl http://YOUR_SERVER_IP:3069/webhook
+    ```
+    
+    Should return the registered callback URL
+    
 
-### Timeout Issues
+### Hubitat Cannot Reach Node.js Server
 
-1.  Check network latency to bridge
-2.  Verify bridge is responding to heartbeats
-3.  Increase UDP\_TIMEOUT if needed (slow networks)
-4.  Check for network congestion
+1.  **Ping from Hubitat**:
+    -   Go to Hubitat hub → Devices → Add Virtual Device → Ping
+    -   Test connectivity to your Node.js server IP
+2.  **Check network settings**:
+    -   Same subnet? (e.g., both on 192.168.x.x)
+    -   Any VLAN restrictions?
 
-## Monitoring and Diagnostics
+### Webhook Working But Polling Also Runs
 
-### Real-time Monitoring
+This is **normal and intended behavior**:
 
-Monitor these metrics via `/ping`:
+-   Webhook provides **immediate updates**
+-   Polling acts as a **backup** in case webhook fails
+-   You can increase `pollInterval` to reduce backup polling frequency
 
--   Connection status
--   Last heartbeat timestamp
--   Error count
--   Pending request count
--   Device discovery status
+## Alternative Configuration: Environment Variable
 
-### Health Check Intervals
+Instead of using Hubitat's automatic webhook registration, you can set the callback URL via environment variable:
 
--   Pending request cleanup: Every 10 seconds
--   Heartbeat timeout check: Every 5 seconds
--   Connection timeout threshold: 30 seconds
-
-## Migration from v4.0
-
-### Breaking Changes
-
-None - all endpoints remain compatible
-
-### New Features
-
--   All commands now support acknowledgment tracking
--   Enhanced error responses with timestamps
--   Connection status information in responses
--   Automatic retry for failed commands
-
-### Configuration Changes
-
-Optional new configuration constants:
-
-```javascript
-const UDP_TIMEOUT = 5000;    // Command response timeout
-const MAX_RETRIES = 3;       // Retry attempts
+```bash
+export HUBITAT_CALLBACK_URL="http://192.168.x.x:39500/callback/connector-bridge-123"
+node hubitat-bridge-driver.js
 ```
 
-## Performance Considerations
+Replace `192.168.x.x` with your Hubitat hub IP and `123` with your bridge device ID.
 
-### Memory Usage
+## Benefits of Bidirectional Communication
 
--   Pending requests are stored in memory
--   Each request ~200 bytes
--   Automatic cleanup prevents memory leaks
+1.  **⚡ Real-time updates** - No more waiting 5 minutes for state changes
+2.  **🔋 Better battery monitoring** - Instant battery level updates
+3.  **📊 Accurate status** - Device position, angle, and status update immediately
+4.  **🔄 Improved reliability** - Webhook + polling = redundancy
+5.  **👍 Better user experience** - Responsive UI in Hubitat
 
-### Network Usage
+## Compatibility
 
--   Each command ~200-500 bytes
--   Heartbeat messages every few seconds
--   Multicast traffic on local network
+-   **Hubitat Elevation**: Tested and working
+-   **Node.js**: v12+ required
+-   **Network**: Hubitat and Node.js server must be on same network or reachable
 
-### Scalability
+## Support
 
--   Tested with 50+ devices
--   Handles concurrent requests
--   Efficient request cleanup
+If you encounter issues:
 
-## Security Considerations
+1.  Check Node.js server logs for errors
+2.  Check Hubitat logs (Live Logging) for webhook activity
+3.  Verify webhook registration status in bridge device attributes
+4.  Test network connectivity between Hubitat and Node.js server
 
-### Encryption
+* * *
 
--   AES-128-ECB for AccessToken generation
--   16-byte KEY requirement
--   Token rotation on each heartbeat
-
-### Network Security
-
--   Multicast address scope (local network)
--   No authentication on HTTP API (use firewall)
--   UDP traffic not encrypted
-
-## License
-
-Based on original Connector Bridge Hubitat Relay by ScubaMikeJax904
-
-## Changelog
-
-### v5.0 (Current)
-
--   Added comprehensive UDP error handling
--   Implemented bidirectional communication
--   Added automatic retry logic
--   Enhanced connection monitoring
--   Improved error logging and diagnostics
--   Added request-response correlation
--   Implemented timeout handling
--   Enhanced API responses with connection status
-
-### v4.0
-
--   Basic UDP bridge functionality
--   HTTP API for device control
--   AccessToken calculation
--   Device discovery
+**Version**: 4.1  
+**Author**: Modified for bidirectional communication  
+**Based on**: Original by ScubaMikeJax904
