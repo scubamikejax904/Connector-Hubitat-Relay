@@ -1,4 +1,4 @@
-//Ver4.1
+//Ver4.2 - Added webhook testing capabilities
 import groovy.json.JsonBuilder
 
 metadata {
@@ -6,9 +6,13 @@ metadata {
         capability "Refresh"
         command "refreshDevices"
         command "pingBridge"
+        command "testWebhook"
+        command "testWebhookDiagnostics"
         attribute "bridgeStatus", "string"
         attribute "lastDiscovery", "string"
         attribute "webhookStatus", "string"
+        attribute "lastWebhookTest", "string"
+        attribute "webhookTestHistory", "string"
     }
 }
 
@@ -127,11 +131,134 @@ def getHubitatCallbackUrl() {
     return "http://${location.hub.localIP}:39500${callbackPath}"
 }
 
+// ------------------- Webhook Testing -------------------
+def testWebhook() {
+    if (!useWebhook) {
+        log.warn "Webhook is disabled in preferences"
+        sendEvent(name: "lastWebhookTest", value: "disabled")
+        return
+    }
+    
+    if (!serverIP || !serverPort) {
+        log.warn "Server IP or Port not set"
+        sendEvent(name: "lastWebhookTest", value: "error-no-config")
+        return
+    }
+    
+    if (logEnable) log.debug "Sending webhook test to Node.js server..."
+    
+    try {
+        def callbackUrl = getHubitatCallbackUrl()
+        def testPayload = [
+            test: true,
+            timestamp: now(),
+            callbackUrl: callbackUrl,
+            source: "Hubitat Manual Test"
+        ]
+        
+        // Send a test request to your server to verify it can reach the webhook
+        def url = "http://${serverIP}:${serverPort}/test-webhook"
+        httpPost(uri: url, body: new JsonBuilder(testPayload).toString(), requestContentType: "application/json") { resp ->
+            if (resp.status == 200) {
+                log.info "✓ Webhook test successful"
+                sendEvent(name: "lastWebhookTest", value: "success-${new Date().format("HH:mm:ss")}")
+                sendEvent(name: "webhookStatus", value: "tested")
+            } else {
+                log.warn "Webhook test failed: HTTP ${resp.status}"
+                sendEvent(name: "lastWebhookTest", value: "failed-${new Date().format("HH:mm:ss")}")
+            }
+        }
+    } catch(Exception e) {
+        log.error "Webhook test error: ${e.message}"
+        sendEvent(name: "lastWebhookTest", value: "error-${new Date().format("HH:mm:ss")}")
+    }
+}
+
+def testWebhookDiagnostics() {
+    def diagnostics = [
+        enabled: useWebhook,
+        serverIP: serverIP,
+        serverPort: serverPort,
+        callbackUrl: getHubitatCallbackUrl(),
+        localHubIP: location.hub.localIP,
+        webhookStatus: currentValue("webhookStatus"),
+        bridgeStatus: currentValue("bridgeStatus"),
+        lastWebhookTest: currentValue("lastWebhookTest")
+    ]
+    
+    if (logEnable) {
+        log.debug "=== Webhook Diagnostics ==="
+        diagnostics.each { key, value ->
+            log.debug "${key}: ${value}"
+        }
+        log.debug "=========================="
+    }
+    
+    // Test callback URL accessibility
+    try {
+        def callbackUrl = getHubitatCallbackUrl()
+        log.info "Testing webhook callback URL: ${callbackUrl}"
+        
+        // Send a test to the server asking it to call our webhook
+        def testUrl = "http://${serverIP}:${serverPort}/test-webhook-callback"
+        def testBody = [callbackUrl: callbackUrl, test: true]
+        
+        httpPost(uri: testUrl, body: new JsonBuilder(testBody).toString(), requestContentType: "application/json") { resp ->
+            if (resp.status == 200) {
+                log.info "✓ Webhook diagnostics test sent successfully"
+                sendEvent(name: "lastWebhookTest", value: "diagnostics-ok-${new Date().format("HH:mm:ss")}")
+                
+                // Update webhook test history attribute
+                def historyJson = """${[
+                    timestamp: new Date().format("yyyy-MM-dd HH:mm:ss"),
+                    type: "diagnostics",
+                    status: "success",
+                    callbackUrl: callbackUrl
+                ]}"""
+                sendEvent(name: "webhookTestHistory", value: historyJson)
+            } else {
+                log.warn "Webhook diagnostics test failed: HTTP ${resp.status}"
+                sendEvent(name: "lastWebhookTest", value: "diagnostics-failed-${new Date().format("HH:mm:ss")}")
+            }
+        }
+    } catch(Exception e) {
+        log.error "Webhook diagnostics error: ${e.message}"
+        sendEvent(name: "lastWebhookTest", value: "diagnostics-error-${new Date().format("HH:mm:ss")}")
+    }
+    
+    return diagnostics
+}
+
 // ------------------- Webhook Callback Handler -------------------
 def callback() {
     def params = request.JSON
-    if (logEnable) log.debug "Webhook callback received: ${params}"
     
+    // Handle webhook test requests
+    if (params?.test == true) {
+        if (logEnable) log.debug "Webhook test received: ${params}"
+        log.info "✓ Webhook connectivity test successful"
+        sendEvent(name: "lastWebhookTest", value: "received-${new Date().format("HH:mm:ss")}")
+        
+        // Update webhook test history attribute
+        def historyJson = """${[
+            timestamp: new Date().format("yyyy-MM-dd HH:mm:ss"),
+            type: "callback",
+            status: "received",
+            source: params?.source ?: "unknown",
+            serverTime: params?.serverInfo?.serverTime ?: "unknown"
+        ]}"""
+        sendEvent(name: "webhookTestHistory", value: historyJson)
+        
+        render contentType: "application/json", data: new JsonBuilder([
+            success: true,
+            message: "Webhook test successful",
+            timestamp: now(),
+            hubitatTime: new Date().format("yyyy-MM-dd HH:mm:ss")
+        ]).toString(), status: 200
+        return
+    }
+    
+    // Normal webhook handling
     def mac = params?.mac
     def data = params?.data
     
