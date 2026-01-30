@@ -1,11 +1,12 @@
-//Ver4.1
-
-
+// Ver 4.2 - Data alignment + state cleanup
 
 metadata {
-    definition(name: "Connector Bridge Roller Child", namespace: "Connector", author: "ScubaMikeJax904", 
-               importUrl: "https://raw.githubusercontent.com/scubamikejax904/Connector-Hubitat-Relay/refs/heads/main/Hubitat%20Connector%20Bridge%20Roller%20Child" )
-    {
+    definition(
+        name: "Connector Bridge Roller Child",
+        namespace: "Connector",
+        author: "ScubaMikeJax904",
+        importUrl: "https://raw.githubusercontent.com/scubamikejax904/Connector-Hubitat-Relay/refs/heads/main/Hubitat%20Connector%20Bridge%20Roller%20Child"
+    ) {
         capability "WindowShade"
         capability "Switch"
         capability "SwitchLevel"
@@ -43,19 +44,9 @@ def setLevel(level) {
     parent.sendTargetCommand(device.deviceNetworkId, level)
     sendEvent(name: "level", value: level)
 
-    if (level == 0) {
-        sendEvent(name: "windowShade", value: "open")
-        sendEvent(name: "switch", value: "on")
-    } else if (level == 100) {
-        sendEvent(name: "windowShade", value: "closed")
-        sendEvent(name: "switch", value: "off")
-    } else {
-        sendEvent(name: "windowShade", value: "partially open")
-        sendEvent(name: "switch", value: "on")
-    }
+    updateShadeFromPosition(level)
 }
 
-// Alias for Hubitat setPosition
 def setPosition(pos) {
     setLevel(pos as int)
 }
@@ -66,72 +57,67 @@ def refresh() {
 
 // ------------------- State Updates from Parent -------------------
 def updateStateFromParent(deviceData) {
-    // The data is passed directly from the parent, not wrapped in a "data" field
-    log.debug "Processing device data for ${device.displayName}: ${deviceData}"
-    
-    if(!deviceData) {
+    if (!deviceData) {
         log.warn "No device data received for ${device.displayName}"
         return
     }
-    
-    // Handle current position (0-100)
-    if(deviceData.currentPosition != null) {
-        def position = deviceData.currentPosition as int
-        log.debug "Found currentPosition: ${position} for ${device.displayName}"
-        
-        sendEvent(name: "level", value: position)
 
-        if(position == 0) {
-            sendEvent(name: "windowShade", value: "open")
-            sendEvent(name: "switch", value: "on")
-        } else if(position == 100) {
-            sendEvent(name: "windowShade", value: "closed")
-            sendEvent(name: "switch", value: "off")
-        } else {
-            sendEvent(name: "windowShade", value: "partially open")
-            sendEvent(name: "switch", value: "on")
-        }
+    if (logEnable) {
+        log.debug "Processing device data for ${device.displayName}: ${deviceData}"
     }
 
-    // Handle operation status: 0=close, 1=open, 2=stop
-    if(deviceData.operation != null) {
-        log.debug "Found operation: ${deviceData.operation} for ${device.displayName}"
-        switch(deviceData.operation as int) {
-            case 0: 
+    // ---- Position ----
+    if (deviceData.currentPosition != null) {
+        def position = deviceData.currentPosition as int
+        sendEvent(name: "level", value: position)
+        updateShadeFromPosition(position)
+    }
+
+    // ---- Operation (live motion state) ----
+    if (deviceData.operation != null) {
+        switch (deviceData.operation as int) {
+            case 0:
                 sendEvent(name: "windowShade", value: "closing")
                 break
-            case 1: 
+            case 1:
                 sendEvent(name: "windowShade", value: "opening")
                 break
-            case 2: 
+            case 2:
                 sendEvent(name: "windowShade", value: "partially open")
                 break
         }
     }
 
-    // Handle current state (this might be useful for additional status)
-    if(deviceData.currentState != null) {
-        log.debug "Found currentState: ${deviceData.currentState} for ${device.displayName}"
-        // You might want to map currentState values to windowShade states
-        // Based on your data, currentState:3 might mean "stopped" or "idle"
+    // ---- Battery ----
+    if (deviceData.batteryLevel != null) {
+        sendEvent(name: "battery", value: deviceData.batteryLevel as int)
     }
 
-    // Handle battery level
-    if(deviceData.batteryLevel != null) {
-        def batteryLevel = deviceData.batteryLevel as int
-        sendEvent(name: "battery", value: batteryLevel)
-        log.debug "Found battery: ${batteryLevel}% for ${device.displayName}"
-    }
-    
-    // Handle RSSI
-    if(deviceData.RSSI != null) {
-        sendEvent(name: "rssi", value: deviceData.RSSI as int)
-        log.debug "Found RSSI: ${deviceData.RSSI} dBm for ${device.displayName}"
+    // ---- RSSI (matches parent: data.raw.RSSI) ----
+    if (deviceData.raw?.RSSI != null) {
+        sendEvent(name: "rssi", value: deviceData.raw.RSSI as int)
     }
 
-    // Update timestamps and online status
-    sendEvent(name: "lastUpdate", value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone))
+    // ---- Timestamps / online ----
+    sendEvent(
+        name: "lastUpdate",
+        value: new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+    )
     sendEvent(name: "online", value: "online")
+}
+
+// ------------------- Helpers -------------------
+private updateShadeFromPosition(int position) {
+    if (position <= 0) {
+        sendEvent(name: "windowShade", value: "open")
+        sendEvent(name: "switch", value: "on")
+    } else if (position >= 100) {
+        sendEvent(name: "windowShade", value: "closed")
+        sendEvent(name: "switch", value: "off")
+    } else {
+        sendEvent(name: "windowShade", value: "partially open")
+        sendEvent(name: "switch", value: "on")
+    }
 }
 
 def markOffline() {
