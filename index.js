@@ -1,5 +1,5 @@
 //Connector Bridge Hubitat Relay by ScubaMikeJax904
-//Ver. 4.2 - Added webhook testing capabilities
+//Ver. 4.3 - Added webhook testing capabilities
 
 // ----- Configuration -----
 const MULTICAST_ADDR = '238.0.0.18';
@@ -24,9 +24,6 @@ let rawToken = null;
 let hubitatCallbackUrl = HUBITAT_CALLBACK_URL;
 const BRIDGE_DEVICE_TYPE = '02000001';
 const MOTOR_DEVICE_TYPE = '10000000';
-
-// Store webhook test results for diagnostics
-const webhookTestHistory = [];
 
 // ----- AccessToken Calculation -----
 function calculateAccessToken(token, key) {
@@ -110,45 +107,6 @@ function pushToHubitat(mac, data) {
     });
 
     req.write(JSON.stringify(payload));
-    req.end();
-}
-
-// ----- Send test webhook to Hubitat -----
-function sendTestWebhook(callbackUrl, testData, callback) {
-    const url = new URL(callbackUrl);
-    const options = {
-        hostname: url.hostname,
-        port: url.port || (url.protocol === 'https:' ? 443 : 80),
-        path: url.pathname + url.search,
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(JSON.stringify(testData))
-        }
-    };
-
-    const req = http.request(options, (res) => {
-        let responseData = '';
-        
-        res.on('data', (chunk) => {
-            responseData += chunk;
-        });
-        
-        res.on('end', () => {
-            console.log(`✓ Test webhook response: ${res.statusCode} - ${responseData}`);
-            if (callback) callback(null, {
-                statusCode: res.statusCode,
-                response: responseData
-            });
-        });
-    });
-
-    req.on('error', (err) => {
-        console.error(`✗ Test webhook error:`, err.message);
-        if (callback) callback(err, null);
-    });
-
-    req.write(JSON.stringify(testData));
     req.end();
 }
 
@@ -270,7 +228,7 @@ function sendCommand(mac, data, callback) {
         msgType: 'WriteDevice',
         mac,
         deviceType: MOTOR_DEVICE_TYPE,
-        AccessToken: accessToken,
+        AccessToken: accessToken,  // FIXED: Use 'AccessToken' not 'token'
         msgID: generateMsgID(),
         data
     };
@@ -350,163 +308,7 @@ app.get('/status/:mac', (req, res) => {
     });
 });
 
-// NEW: Test webhook endpoint - receives test from Hubitat
-app.post('/test-webhook', (req, res) => {
-    const { test, timestamp, callbackUrl, source } = req.body;
-    console.log('\n=== Webhook Test Received ===');
-    console.log(`Source: ${source}`);
-    console.log(`Timestamp: ${new Date(timestamp).toLocaleString()}`);
-    console.log(`Callback URL: ${callbackUrl}`);
-    
-    // Store test result
-    const testResult = {
-        timestamp: new Date(timestamp).toISOString(),
-        source: source,
-        callbackUrl: callbackUrl,
-        status: 'received',
-        serverTime: new Date().toISOString()
-    };
-    
-    webhookTestHistory.unshift(testResult);
-    
-    // Keep only last 10 test results
-    if (webhookTestHistory.length > 10) {
-        webhookTestHistory.pop();
-    }
-    
-    console.log('✓ Webhook test successful - connectivity confirmed');
-    console.log('============================\n');
-    
-    res.json({ 
-        success: true, 
-        received: true, 
-        callbackUrl: callbackUrl,
-        serverTime: testResult.serverTime,
-        message: 'Webhook test successful - server received test from Hubitat'
-    });
-});
-
-// NEW: Test webhook callback endpoint - sends test back to Hubitat
-app.post('/test-webhook-callback', (req, res) => {
-    const { callbackUrl, test } = req.body;
-    console.log('\n=== Testing Webhook Callback ===');
-    console.log(`Target URL: ${callbackUrl}`);
-    
-    if (!callbackUrl) {
-        console.error('✗ No callback URL provided');
-        return res.status(400).json({ error: 'callbackUrl is required' });
-    }
-    
-    const testPayload = {
-        test: true,
-        timestamp: Date.now(),
-        source: "Server Test",
-        serverInfo: {
-            callbackUrl: callbackUrl,
-            serverTime: new Date().toISOString(),
-            testId: generateMsgID()
-        }
-    };
-    
-    console.log('Sending test payload:', JSON.stringify(testPayload, null, 2));
-    
-    sendTestWebhook(callbackUrl, testPayload, (err, result) => {
-        // Store test result
-        const testResult = {
-            timestamp: new Date().toISOString(),
-            type: 'callback_test',
-            callbackUrl: callbackUrl,
-            status: err ? 'failed' : 'success',
-            error: err ? err.message : null,
-            statusCode: result ? result.statusCode : null,
-            response: result ? result.response : null
-        };
-        
-        webhookTestHistory.unshift(testResult);
-        
-        // Keep only last 10 test results
-        if (webhookTestHistory.length > 10) {
-            webhookTestHistory.pop();
-        }
-        
-        if (err) {
-            console.error('✗ Webhook callback test failed:', err.message);
-            console.log('==============================\n');
-            return res.status(500).json({ 
-                success: false, 
-                error: err.message,
-                testResult: testResult
-            });
-        }
-        
-        console.log(`✓ Webhook callback test successful: ${result.statusCode}`);
-        console.log('Response:', result.response);
-        console.log('==============================\n');
-        
-        res.json({ 
-            success: true, 
-            callbackTest: 'ok',
-            statusCode: result.statusCode,
-            response: result.response,
-            testResult: testResult
-        });
-    });
-});
-
-// NEW: Get webhook test history
-app.get('/webhook-tests', (req, res) => {
-    console.log('\nHTTP GET /webhook-tests');
-    res.json({
-        totalTests: webhookTestHistory.length,
-        tests: webhookTestHistory,
-        currentCallbackUrl: hubitatCallbackUrl || 'not configured'
-    });
-});
-
-// NEW: Webhook diagnostics endpoint
-app.get('/webhook-diagnostics', (req, res) => {
-    console.log('\nHTTP GET /webhook-diagnostics');
-    
-    const diagnostics = {
-        serverStatus: {
-            running: true,
-            uptime: process.uptime(),
-            memoryUsage: process.memoryUsage(),
-            timestamp: new Date().toISOString()
-        },
-        webhookConfiguration: {
-            callbackUrl: hubitatCallbackUrl || 'not configured',
-            status: hubitatCallbackUrl ? 'configured' : 'not configured',
-            urlValid: hubitatCallbackUrl ? isValidUrl(hubitatCallbackUrl) : false
-        },
-        testHistory: {
-            totalTests: webhookTestHistory.length,
-            recentTests: webhookTestHistory.slice(0, 5),
-            lastTest: webhookTestHistory.length > 0 ? webhookTestHistory[0] : null
-        },
-        systemInfo: {
-            platform: process.platform,
-            nodeVersion: process.version,
-            accessToken: accessToken ? 'ready' : 'waiting',
-            hasKey: !!KEY,
-            deviceCount: Object.keys(devices).length
-        }
-    };
-    
-    res.json(diagnostics);
-});
-
-// Helper function to validate URLs
-function isValidUrl(string) {
-    try {
-        new URL(string);
-        return true;
-    } catch (_) {
-        return false;
-    }
-}
-
-// Register/update Hubitat webhook callback URL
+// NEW: Register/update Hubitat webhook callback URL
 app.post('/webhook', (req, res) => {
     const { callbackUrl } = req.body;
     if (callbackUrl) {
@@ -526,9 +328,72 @@ app.post('/webhook', (req, res) => {
 app.get('/webhook', (req, res) => {
     res.json({ 
         callbackUrl: hubitatCallbackUrl || 'not configured',
-        status: hubitatCallbackUrl ? 'active' : 'inactive',
-        urlValid: hubitatCallbackUrl ? isValidUrl(hubitatCallbackUrl) : false
+        status: hubitatCallbackUrl ? 'active' : 'inactive'
     });
+});
+
+// Test webhook by sending a test push to Hubitat
+app.post('/webhook/test', (req, res) => {
+    if (!hubitatCallbackUrl) {
+        return res.status(400).json({ 
+            error: 'No webhook URL configured',
+            message: 'Set HUBITAT_CALLBACK_URL or POST to /webhook first'
+        });
+    }
+
+    const testPayload = {
+        mac: 'TEST-DEVICE',
+        data: {
+            currentPosition: 50,
+            batteryLevel: 85,
+            raw: {
+                RSSI: -60,
+                currentState: 3
+            }
+        },
+        timestamp: new Date().toISOString(),
+        test: true
+    };
+
+    const url = new URL(hubitatCallbackUrl);
+    const options = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(JSON.stringify(testPayload))
+        }
+    };
+
+    const reqHttp = http.request(options, (httpRes) => {
+        let responseData = '';
+        httpRes.on('data', chunk => responseData += chunk);
+        httpRes.on('end', () => {
+            console.log(`✓ Webhook test response: ${httpRes.statusCode}`);
+            res.json({
+                status: 'success',
+                message: 'Test webhook sent to Hubitat',
+                statusCode: httpRes.statusCode,
+                response: responseData,
+                payload: testPayload
+            });
+        });
+    });
+
+    reqHttp.on('error', (err) => {
+        console.error('✗ Webhook test failed:', err.message);
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to send test webhook',
+            error: err.message,
+            callbackUrl: hubitatCallbackUrl
+        });
+    });
+
+    reqHttp.write(JSON.stringify(testPayload));
+    reqHttp.end();
 });
 
 // Open endpoint
@@ -606,17 +471,29 @@ app.get('/angle/:mac/:angle', (req, res) => {
     });
 });
 
+// Generic move command (POST for Hubitat integration)
+app.post('/move/:mac', (req, res) => {
+    const { mac } = req.params;
+    const data = req.body;
+    console.log(`\nHTTP POST /move/${mac}:`, data);
+    
+    sendCommand(mac, data, (err) => {
+        if (err) {
+            return res.status(500).json({ error: err.message || err });
+        }
+        res.json({ mac, command: data, status: 'sent' });
+    });
+});
+
 // Start HTTP server
 app.listen(PORT_HTTP, () => {
     console.log('\n' + '='.repeat(60));
     console.log('Connector WLAN Integration API Server');
-    console.log('Version 4.2 - Enhanced Webhook Testing');
     console.log('='.repeat(60));
     console.log(`✓ HTTP API running at http://localhost:${PORT_HTTP}`);
     console.log(`✓ Multicast address: ${MULTICAST_ADDR}`);
     console.log(`✓ Listening on port: ${PORT_IN}`);
     console.log(`✓ Sending to port: ${PORT_OUT}`);
-    console.log(`✓ Webhook testing endpoints enabled`);
     
     if (!KEY) {
         console.log('\n⚠ WARNING: CONNECTOR_KEY not set!');
