@@ -1,4 +1,4 @@
-// Ver4.4 - Webhook + discovery fixes
+// Ver4.4 - Webhook + discovery fixes + HTTP method signature fixes
 import groovy.json.JsonBuilder
 
 metadata {
@@ -10,17 +10,6 @@ metadata {
         attribute "bridgeStatus", "string"
         attribute "lastDiscovery", "string"
         attribute "webhookStatus", "string"
-    }
-}
-
-/*
- * REQUIRED so Hubitat actually exposes the callback endpoint
- */
-mappings {
-    path("/callback/connector-bridge-${device.id}") {
-        action: [
-            POST: "callback"
-        ]
     }
 }
 
@@ -100,11 +89,11 @@ def registerWebhook() {
     if (logEnable) log.debug "Registering webhook: ${callbackUrl}"
 
     try {
-        httpPost(
+        httpPost([
             uri: "http://${serverIP}:${serverPort}/webhook",
             body: new JsonBuilder([callbackUrl: callbackUrl]).toString(),
             requestContentType: "application/json"
-        ) { resp ->
+        ]) { resp ->
             sendEvent(
                 name: "webhookStatus",
                 value: resp.status == 200 ? "registered" : "error"
@@ -118,7 +107,9 @@ def registerWebhook() {
 
 def testWebhook() {
     try {
-        httpPost(uri: "http://${serverIP}:${serverPort}/webhook/test") { resp ->
+        httpPost([
+            uri: "http://${serverIP}:${serverPort}/webhook/test"
+        ]) { resp ->
             sendEvent(
                 name: "webhookStatus",
                 value: resp.status == 200 ? "registered" : "error"
@@ -213,11 +204,11 @@ def updateChildState(mac, data) {
 // ------------------- Move Commands -------------------
 def sendMoveCommand(mac, Map body) {
     try {
-        httpPost(
+        httpPost([
             uri: "http://${serverIP}:${serverPort}/move/${mac}",
             body: new JsonBuilder(body).toString(),
             requestContentType: "application/json"
-        )
+        ])
     } catch (e) {
         log.error "Move command error for ${mac}: ${e.message}"
     }
